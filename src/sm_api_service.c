@@ -39,6 +39,7 @@
 
 #define SM_API_RETRY_INITIAL_MS 250u
 #define SM_API_RETRY_MAX_MS 5000u
+#define SM_API_LISTENER_CHECK_MS 10000u
 #define SM_API_ROUTE_SIZE 128u
 #define SM_API_WORKER_COUNT 8u
 #define SM_API_CONNECTION_LIMIT 32u
@@ -58,6 +59,7 @@ typedef struct {
   pthread_cond_t cond;
   bool started;
   bool stop_requested;
+  bool restart_requested;
   struct MHD_Daemon *daemon;
   char bind_address[MAX_API_BIND_ADDRESS];
   uint16_t port;
@@ -190,11 +192,13 @@ static bool wait_until_runtime_awake(void) {
     }
   }
   bool keep_running = !g_api.stop_requested;
+  if (keep_running)
+    g_api.restart_requested = false;
   pthread_mutex_unlock(&g_api.mutex);
   return keep_running;
 }
 
-static bool wait_before_listener_retry(uint32_t delay_ms) {
+static bool wait_for_listener_event(uint32_t delay_ms) {
   struct timespec deadline;
   if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
     sceKernelUsleep(SM_API_RETRY_INITIAL_MS * 1000u);
@@ -213,21 +217,19 @@ static bool wait_before_listener_retry(uint32_t delay_ms) {
 
   pthread_mutex_lock(&g_api.mutex);
   int wait_status = 0;
-  while (!g_api.stop_requested && !runtime_sleep_mode_active()) {
+  while (!g_api.stop_requested && !g_api.restart_requested &&
+         !runtime_sleep_mode_active()) {
     wait_status =
         pthread_cond_timedwait(&g_api.cond, &g_api.mutex, &deadline);
     if (wait_status != 0)
       break;
   }
+  if (wait_status != 0 && wait_status != ETIMEDOUT) {
+    log_debug("  [API] listener wait failed: %s", strerror(wait_status));
+    g_api.stop_requested = true;
+  }
   bool keep_running = !g_api.stop_requested;
   pthread_mutex_unlock(&g_api.mutex);
-
-  if (keep_running && wait_status != 0 && wait_status != ETIMEDOUT) {
-    sceKernelUsleep(SM_API_RETRY_INITIAL_MS * 1000u);
-    pthread_mutex_lock(&g_api.mutex);
-    keep_running = !g_api.stop_requested;
-    pthread_mutex_unlock(&g_api.mutex);
-  }
   return keep_running;
 }
 
@@ -914,7 +916,8 @@ static const char *game_platform_name(const char *title_id,
 static bool api_listener_stop_requested(void *ctx) {
   (void)ctx;
   pthread_mutex_lock(&g_api.mutex);
-  bool stopping = g_api.stop_requested;
+  bool stopping = g_api.stop_requested || g_api.restart_requested ||
+                  runtime_sleep_mode_active();
   pthread_mutex_unlock(&g_api.mutex);
   return stopping;
 }
@@ -3502,6 +3505,23 @@ static struct MHD_Daemon *start_http_daemon(const char *bind_address,
   return daemon;
 }
 
+static int http_listener_status(struct MHD_Daemon *daemon) {
+  const union MHD_DaemonInfo *info =
+      MHD_get_daemon_info(daemon, MHD_DAEMON_INFO_LISTEN_FD);
+  if (!info || info->listen_fd == MHD_INVALID_SOCKET)
+    return EBADF;
+
+  int accepting = 0;
+  socklen_t size = sizeof(accepting);
+  if (getsockopt(info->listen_fd, SOL_SOCKET, SO_ACCEPTCONN,
+                 &accepting, &size) != 0) {
+    // A periodic probe can defer an interrupted read until the next check.
+    // Do not keep the service thread in a retry loop during shutdown.
+    return errno == EINTR ? 0 : (errno != 0 ? errno : EIO);
+  }
+  return accepting ? 0 : ENOTCONN;
+}
+
 static void *service_thread_main(void *arg) {
   (void)arg;
   pthread_mutex_lock(&g_api.mutex);
@@ -3522,14 +3542,15 @@ static void *service_thread_main(void *arg) {
                   bind_address, (unsigned int)port, strerror(start_error));
         outage_logged = true;
       }
-      if (!wait_before_listener_retry(retry_delay_ms))
+      if (!wait_for_listener_event(retry_delay_ms))
         break;
       retry_delay_ms = next_retry_delay_ms(retry_delay_ms);
       continue;
     }
 
     pthread_mutex_lock(&g_api.mutex);
-    if (g_api.stop_requested || runtime_sleep_mode_active()) {
+    if (g_api.stop_requested || g_api.restart_requested ||
+        runtime_sleep_mode_active()) {
       bool stopping = g_api.stop_requested;
       pthread_mutex_unlock(&g_api.mutex);
       MHD_stop_daemon(daemon);
@@ -3552,23 +3573,37 @@ static void *service_thread_main(void *arg) {
     outage_logged = false;
     retry_delay_ms = SM_API_RETRY_INITIAL_MS;
 
-    pthread_mutex_lock(&g_api.mutex);
-    while (!g_api.stop_requested && !runtime_sleep_mode_active()) {
-      int rc = pthread_cond_wait(&g_api.cond, &g_api.mutex);
-      if (rc != 0) {
-        log_debug("  [API] service wait failed: %s", strerror(rc));
-        g_api.stop_requested = true;
+    int listener_error = 0;
+    while (wait_for_listener_event(SM_API_LISTENER_CHECK_MS)) {
+      if (api_listener_stop_requested(NULL))
         break;
-      }
+      listener_error = http_listener_status(daemon);
+      if (listener_error != 0)
+        break;
+    }
+    pthread_mutex_lock(&g_api.mutex);
+    // Resume/stop may have arrived while the socket was being checked. Its
+    // invalidation is then expected, rather than an independent API outage.
+    if (g_api.stop_requested || g_api.restart_requested ||
+        runtime_sleep_mode_active()) {
+      listener_error = 0;
     }
     if (g_api.daemon == daemon)
       g_api.daemon = NULL;
+    // Let long-running request handlers cancel before MHD_stop_daemon joins
+    // its workers. Background storage jobs have their own cancellation state.
+    g_api.restart_requested = true;
     bool stopping = g_api.stop_requested;
     pthread_mutex_unlock(&g_api.mutex);
 
     MHD_stop_daemon(daemon);
     if (stopping)
       break;
+    if (listener_error != 0) {
+      log_debug("  [API] HTTP listener lost at %s:%u: %s; recovery scheduled",
+                bind_address, (unsigned int)port, strerror(listener_error));
+      outage_logged = true;
+    }
   }
   return NULL;
 }
@@ -3594,6 +3629,7 @@ bool sm_api_service_start(void) {
   }
   g_api.daemon = NULL;
   g_api.stop_requested = false;
+  g_api.restart_requested = false;
   (void)strlcpy(g_api.bind_address, bind_address,
                 sizeof(g_api.bind_address));
   g_api.port = port;
@@ -3629,6 +3665,7 @@ static void stop_api_listener(void) {
   pthread_mutex_lock(&g_api.mutex);
   g_api.started = false;
   g_api.stop_requested = false;
+  g_api.restart_requested = false;
   g_api.daemon = NULL;
   pthread_mutex_unlock(&g_api.mutex);
 }
@@ -3655,7 +3692,10 @@ void sm_api_service_on_sleep_change(bool active) {
     return;
   }
 
-  (void)active;
+  // Preserve resume across a coalesced sleep/wake notification: the service
+  // may never have observed sleep=true, but its old socket still needs reset.
+  if (!active)
+    g_api.restart_requested = true;
   pthread_cond_broadcast(&g_api.cond);
   pthread_mutex_unlock(&g_api.mutex);
 }
