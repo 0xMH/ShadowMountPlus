@@ -4,12 +4,15 @@
 #include "sm_config_mount.h"
 #include "sm_filesystem.h"
 #include "sm_gameinfo.h"
+#include "sm_game_lifecycle.h"
 #include "sm_log.h"
 #include "sm_mount_diag.h"
 #include "sm_path_utils.h"
 #include "sm_paths.h"
+#include "sm_runtime.h"
 #include "sm_scan.h"
 #include "sm_types.h"
+#include "sm_time.h"
 
 #include <pthread.h>
 #include <sys/time.h>
@@ -38,6 +41,9 @@ typedef struct {
   const char *label;
   bool created_mount_path;
   bool source_detached;
+  bool owned_mount;
+  bool mount_identity_valid;
+  fsid_t mount_fsid;
   // Identify the source volume, rather than its sandbox nullfs alias.
   fsid_t source_fsid;
 } fakelib_layer_t;
@@ -54,6 +60,8 @@ typedef struct {
   char notification_target[MAX_PATH];
   bool notify_pending;
   bool mounts_ready;
+  uint64_t cleanup_next_us;
+  uint64_t cleanup_deadline_us;
 } fakelib_session_t;
 
 typedef struct {
@@ -134,28 +142,98 @@ static bool mount_sandbox_layer(const char *title_id,
   return false;
 }
 
-static bool unmount_sandbox_layer(const fakelib_layer_t *layer) {
-  const char *mount_path = layer->mount_path;
-  if (!layer->source_path[0] || unmount(mount_path, 0) == 0 || errno == ENOENT ||
-      errno == EINVAL) {
-    if (layer->created_mount_path && rmdir(mount_path) != 0 &&
-        errno != ENOENT) {
-      log_debug("  [FAKELIB] mount directory cleanup skipped for %s: %s",
-                mount_path, strerror(errno));
+static bool sandbox_mount_matches(const struct statfs *fs,
+                                   const char *source, bool overlay) {
+  const char *mounted_source = fs->f_mntfromname;
+  if (strncmp(mounted_source, "<above>:", 8) == 0)
+    mounted_source += 8;
+  return strcmp(fs->f_fstypename, overlay ? "unionfs" : "nullfs") == 0 &&
+         strcmp(mounted_source, source) == 0;
+}
+
+static int sandbox_mount_identity_present(const fakelib_layer_t *layer) {
+  struct statfs *mounts = NULL;
+  int count = sm_mount_table_snapshot(&mounts);
+  if (count < 0)
+    return -1;
+  bool found = false;
+  for (int i = 0; i < count; ++i) {
+    bool matches = layer->mount_identity_valid
+        ? memcmp(&mounts[i].f_fsid, &layer->mount_fsid,
+                 sizeof(layer->mount_fsid)) == 0
+        : strcmp(mounts[i].f_mntonname, layer->mount_path) == 0 &&
+          strcmp(mounts[i].f_fstypename,
+                 strcmp(layer->label, "directory") == 0 ? "nullfs" : "unionfs") == 0;
+    if (matches) {
+      found = true;
+      break;
     }
-    if (layer->source_path[0])
+  }
+  free(mounts);
+  return found;
+}
+
+static bool unmount_sandbox_layer(fakelib_layer_t *layer) {
+  const char *mount_path = layer->mount_path;
+  if (layer->source_path[0] && !layer->owned_mount)
+    return true;
+
+  if (layer->source_path[0]) {
+    struct statfs fs;
+    if (statfs(mount_path, &fs) != 0) {
+      if (errno != ENOENT)
+        return false;
+      int present = sandbox_mount_identity_present(layer);
+      if (present != 0) {
+        if (present > 0)
+          errno = EBUSY;
+        return false;
+      }
+    } else if (strcmp(fs.f_mntonname, mount_path) != 0 ||
+               (layer->mount_identity_valid &&
+                memcmp(&fs.f_fsid, &layer->mount_fsid,
+                       sizeof(layer->mount_fsid)) != 0)) {
+      // A newer mount may cover this one. Never unmount it by the old path.
+      int present = sandbox_mount_identity_present(layer);
+      if (present != 0) {
+        if (present > 0)
+          errno = EBUSY;
+        return false;
+      }
+      layer->created_mount_path = false;
+      return true;
+    } else {
+      if (!layer->mount_identity_valid &&
+          !sandbox_mount_matches(&fs, layer->source_path,
+                                 strcmp(layer->label, "directory") != 0)) {
+        errno = EBUSY;
+        return false;
+      }
+      if (unmount(mount_path, 0) != 0 && errno != ENOENT && errno != EINVAL) {
+        int unmount_errno = errno;
+        if (unmount_errno == EBUSY && g_fakelib_mount.cleanup_deadline_us == 0)
+          sm_mount_diag_log_busy(mount_path);
+        errno = unmount_errno;
+        return false;
+      }
       log_debug("  [FAKELIB] %s unmounted: %s -> %s", layer->label,
                 layer->source_path, mount_path);
-    return true;
+    }
+    // A leftover directory is separate from an owned mount.
+    layer->source_path[0] = '\0';
+    layer->owned_mount = false;
   }
 
-  int unmount_errno = errno;
-  if (unmount_errno == EBUSY)
-    sm_mount_diag_log_busy(mount_path);
-  log_debug("  [FAKELIB] %s unmount deferred for %s: %s", layer->label,
-            mount_path, strerror(unmount_errno));
-  errno = unmount_errno;
-  return false;
+  if (layer->created_mount_path) {
+    if (rmdir(mount_path) != 0 && errno != ENOENT) {
+      if (g_fakelib_mount.cleanup_deadline_us == 0)
+        log_debug("  [FAKELIB] mount directory cleanup skipped for %s: %s",
+                  mount_path, strerror(errno));
+      // ShellCore or another producer may have populated the directory. Its
+      // contents must not keep an already-unmounted session active.
+    }
+  }
+  return true;
 }
 
 static bool track_sandbox_layer(const char *title_id,
@@ -167,15 +245,44 @@ static bool track_sandbox_layer(const char *title_id,
     errno = ENOSPC;
     return false;
   }
-  if (!mount_sandbox_layer(title_id, source_path, mount_path, label, overlay,
-                         flags))
+  struct statfs fs;
+  if (statfs(mount_path, &fs) != 0)
+    return false;
+  // unionfs intentionally covers ShellCore's native library mount. An existing
+  // unionfs at that same path, however, must be reused or left to its owner.
+  bool owned = strcmp(fs.f_mntonname, mount_path) != 0 ||
+               (overlay && strcmp(fs.f_fstypename, "unionfs") != 0);
+  if (!owned && !sandbox_mount_matches(&fs, source_path, overlay)) {
+    log_debug("  [FAKELIB] sandbox mount occupied: %s (%s)", title_id,
+              mount_path);
+    errno = EBUSY;
+    return false;
+  }
+  if (owned && !mount_sandbox_layer(title_id, source_path, mount_path, label,
+                                   overlay, flags))
     return false;
 
   fakelib_layer_t *layer =
       &g_fakelib_mount.layers[g_fakelib_mount.layer_count++];
+  memset(layer, 0, sizeof(*layer));
+  layer->owned_mount = owned;
   layer->label = label;
   (void)strlcpy(layer->source_path, source_path, sizeof(layer->source_path));
   (void)strlcpy(layer->mount_path, mount_path, sizeof(layer->mount_path));
+  if (owned) {
+    // Keep the successful nmount recorded even if its identity cannot be read.
+    if (statfs(mount_path, &fs) != 0)
+      return false;
+    // f_mntfromname can truncate long source paths. nmount already succeeded;
+    // capture the target identity without requiring a full source round-trip.
+    if (strcmp(fs.f_mntonname, mount_path) != 0 ||
+        strcmp(fs.f_fstypename, overlay ? "unionfs" : "nullfs") != 0) {
+      errno = EBUSY;
+      return false;
+    }
+  }
+  layer->mount_fsid = fs.f_fsid;
+  layer->mount_identity_valid = true;
   return true;
 }
 
@@ -219,16 +326,18 @@ static bool mount_sandbox_directory(const char *title_id,
     }
   }
 
-  if (!track_sandbox_layer(title_id, source_path, mount_path, "directory",
-                           false, flags)) {
+  size_t previous_count = g_fakelib_mount.layer_count;
+  bool mounted = track_sandbox_layer(title_id, source_path, mount_path,
+                                     "directory", false, flags);
+  if (g_fakelib_mount.layer_count > previous_count)
+    g_fakelib_mount.layers[previous_count].created_mount_path = created;
+  if (!mounted) {
     int mount_errno = errno;
-    if (created)
+    if (created && g_fakelib_mount.layer_count == previous_count)
       (void)rmdir(mount_path);
     errno = mount_errno;
     return false;
   }
-  g_fakelib_mount.layers[g_fakelib_mount.layer_count - 1u].created_mount_path =
-      created;
   return true;
 }
 
@@ -318,6 +427,10 @@ static bool sync_sandbox_storage_root(const char *title_id,
 
     // Never reuse a busy alias when a different volume occupies this path.
     layer->source_detached = true;
+    if (!layer->owned_mount && mounted) {
+      errno = EBUSY;
+      return false;
+    }
     if (!unmount_sandbox_layer(layer))
       return false;
     --g_fakelib_mount.layer_count;
@@ -407,10 +520,16 @@ static bool resolve_sandbox_paths(const char *title_id,
     return false;
 
   size_t title_len = strlen(title_id);
-  int best_index = -1;
   bool found = false;
   struct dirent *entry;
-  while ((entry = readdir(d)) != NULL) {
+  int read_errno = 0;
+  while (true) {
+    errno = 0;
+    entry = readdir(d);
+    if (!entry) {
+      read_errno = errno;
+      break;
+    }
     if (entry->d_name[0] == '.')
       continue;
     if (strncmp(entry->d_name, title_id, title_len) != 0)
@@ -430,36 +549,77 @@ static bool resolve_sandbox_paths(const char *title_id,
     if (errno == ERANGE || !suffix_end || *suffix_end != '\0' ||
         idx_long > INT_MAX)
       continue;
-    int idx = (int)idx_long;
-    if (idx < best_index)
+    // ShellCore reuses the first free suffix. An older, higher-numbered
+    // directory containing only our aliases must not hide the current app0.
+    char candidate[MAX_PATH];
+    int length = snprintf(candidate, sizeof(candidate), "/mnt/sandbox/%s/app0",
+                          entry->d_name);
+    struct stat candidate_st;
+    if (length < 0 || (size_t)length >= sizeof(candidate))
       continue;
-
-    best_index = idx;
+    if (stat(candidate, &candidate_st) != 0) {
+      int lookup_errno = errno;
+      if (lookup_errno == ENOENT || lookup_errno == ENOTDIR)
+        continue;
+      closedir(d);
+      errno = lookup_errno;
+      return false;
+    }
+    if (!S_ISDIR(candidate_st.st_mode))
+      continue;
+    if (found) {
+      closedir(d);
+      errno = EBUSY; // Multiple live sandboxes need an explicit owner.
+      return false;
+    }
     (void)strlcpy(sandbox_id, entry->d_name, sizeof(sandbox_id));
     found = true;
   }
 
   closedir(d);
-  if (!found)
+  if (read_errno != 0 || !found) {
+    errno = read_errno != 0 ? read_errno : ENOENT;
     return false;
+  }
 
   struct stat st;
   char sandbox_root[MAX_PATH];
   int written = snprintf(sandbox_root, sizeof(sandbox_root), "/mnt/sandbox/%s",
                          sandbox_id);
-  if (written < 0 || (size_t)written >= sizeof(sandbox_root))
+  if (written < 0 || (size_t)written >= sizeof(sandbox_root)) {
+    errno = ENAMETOOLONG;
     return false;
+  }
   written = snprintf(app0_path, MAX_PATH, "%s/app0", sandbox_root);
-  if (written < 0 || (size_t)written >= MAX_PATH ||
-      stat(app0_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+  if (written < 0 || (size_t)written >= MAX_PATH) {
     app0_path[0] = '\0';
+    errno = ENAMETOOLONG;
+    return false;
+  }
+  if (stat(app0_path, &st) != 0) {
+    app0_path[0] = '\0';
+    return false;
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    app0_path[0] = '\0';
+    errno = ENOTDIR;
+    return false;
   }
   d = opendir(sandbox_root);
-  if (!d)
+  if (!d) {
+    app0_path[0] = '\0';
     return false;
+  }
 
   found = false;
-  while ((entry = readdir(d)) != NULL) {
+  read_errno = 0;
+  while (true) {
+    errno = 0;
+    entry = readdir(d);
+    if (!entry) {
+      read_errno = errno;
+      break;
+    }
     if (entry->d_name[0] == '.')
       continue;
     if (strcmp(entry->d_name, "app0") == 0)
@@ -469,7 +629,13 @@ static bool resolve_sandbox_paths(const char *title_id,
                        entry->d_name);
     if (written < 0 || (size_t)written >= MAX_PATH)
       continue;
-    if (stat(mount_path, &st) != 0 || !S_ISDIR(st.st_mode))
+    if (stat(mount_path, &st) != 0) {
+      if (errno == ENOENT || errno == ENOTDIR)
+        continue;
+      read_errno = errno;
+      break;
+    }
+    if (!S_ISDIR(st.st_mode))
       continue;
 
     found = true;
@@ -477,15 +643,22 @@ static bool resolve_sandbox_paths(const char *title_id,
   }
 
   closedir(d);
+  if (read_errno != 0) {
+    app0_path[0] = mount_path[0] = '\0';
+    errno = read_errno;
+    return false;
+  }
   if (!found)
     mount_path[0] = '\0';
-  return app0_path[0] != '\0' || found;
+  return true;
 }
 
 static fakelib_source_kind_t resolve_game_fakelib_source_for_path(
     const char *title_id, const char *game_path, bool include_backport,
-    char source_path[MAX_PATH]) {
+    char source_path[MAX_PATH], bool *backport_source_out) {
   source_path[0] = '\0';
+  if (backport_source_out)
+    *backport_source_out = false;
 
   char backport_path[MAX_PATH] = {0};
   bool has_backport = include_backport &&
@@ -495,13 +668,14 @@ static fakelib_source_kind_t resolve_game_fakelib_source_for_path(
     const char *root;
     const char *directory;
     fakelib_source_kind_t kind;
+    bool backport_source;
   } candidates[] = {
       {has_backport ? backport_path : NULL, "fakelib2",
-       FAKELIB_SOURCE_FAKELIB2},
+       FAKELIB_SOURCE_FAKELIB2, true},
       {has_backport ? backport_path : NULL, "fakelib",
-       FAKELIB_SOURCE_COMPOSABLE},
-      {has_game ? game_path : NULL, "fakelib2", FAKELIB_SOURCE_FAKELIB2},
-      {has_game ? game_path : NULL, "fakelib", FAKELIB_SOURCE_COMPOSABLE},
+       FAKELIB_SOURCE_COMPOSABLE, true},
+      {has_game ? game_path : NULL, "fakelib2", FAKELIB_SOURCE_FAKELIB2, false},
+      {has_game ? game_path : NULL, "fakelib", FAKELIB_SOURCE_COMPOSABLE, false},
   };
   struct stat st;
   for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
@@ -511,6 +685,8 @@ static fakelib_source_kind_t resolve_game_fakelib_source_for_path(
                            candidates[i].root, candidates[i].directory);
     if (written > 0 && (size_t)written < MAX_PATH &&
         stat(source_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+      if (backport_source_out)
+        *backport_source_out = candidates[i].backport_source;
       return candidates[i].kind;
     }
   }
@@ -1471,7 +1647,7 @@ static void prepare_title_cache(const char *title_id, const char *game_path,
 
   char game_source_path[MAX_PATH];
   fakelib_source_kind_t source_kind = resolve_game_fakelib_source_for_path(
-      title_id, game_path, include_backport, game_source_path);
+      title_id, game_path, include_backport, game_source_path, NULL);
   bool exclusive = source_kind == FAKELIB_SOURCE_FAKELIB2;
   if (source_kind == FAKELIB_SOURCE_NONE &&
       !resolve_global_fakelib_source(title_id, game_source_path)) {
@@ -1610,17 +1786,114 @@ static bool cleanup_fakelib_mount(void) {
   }
 
   g_fakelib_mount.mounts_ready = false;
-  while (g_fakelib_mount.layer_count > 0) {
-    fakelib_layer_t *layer =
-        &g_fakelib_mount.layers[g_fakelib_mount.layer_count - 1];
-    if (!unmount_sandbox_layer(layer))
-      return false;
-    memset(layer, 0, sizeof(*layer));
-    g_fakelib_mount.layer_count--;
+  int cleanup_errno = 0;
+  bool removed[sizeof(g_fakelib_mount.layers) /
+               sizeof(g_fakelib_mount.layers[0])] = {false};
+  for (size_t i = g_fakelib_mount.layer_count; i > 0; --i) {
+    fakelib_layer_t *layer = &g_fakelib_mount.layers[i - 1u];
+    size_t length = strlen(layer->mount_path);
+    bool dependent = false;
+    for (size_t j = 0; j < g_fakelib_mount.layer_count; ++j) {
+      const fakelib_layer_t *other = &g_fakelib_mount.layers[j];
+      if (removed[j] || other == layer)
+        continue;
+      if ((strncmp(other->mount_path, layer->mount_path, length) == 0 &&
+           other->mount_path[length] == '/') ||
+          (strncmp(other->source_path, layer->mount_path, length) == 0 &&
+           (other->source_path[length] == '/' ||
+            other->source_path[length] == '\0'))) {
+        dependent = true;
+        break;
+      }
+    }
+    if (dependent)
+      continue;
+    if (!unmount_sandbox_layer(layer)) {
+      // Retry only transient busy failures. Preserve any real error
+      // even when another independent mount is merely busy.
+      int error = errno != 0 ? errno : EIO;
+      if (cleanup_errno == 0 || cleanup_errno == EBUSY)
+        cleanup_errno = error;
+      continue;
+    }
+    removed[i - 1u] = true;
   }
-
+  // Preserve dependency order and compact retained layers once per pass.
+  size_t retained = 0;
+  for (size_t i = 0; i < g_fakelib_mount.layer_count; ++i) {
+    if (removed[i])
+      continue;
+    if (retained != i)
+      g_fakelib_mount.layers[retained] = g_fakelib_mount.layers[i];
+    ++retained;
+  }
+  memset(&g_fakelib_mount.layers[retained], 0,
+         (g_fakelib_mount.layer_count - retained) *
+             sizeof(g_fakelib_mount.layers[0]));
+  g_fakelib_mount.layer_count = retained;
+  if (g_fakelib_mount.layer_count > 0) {
+    errno = cleanup_errno != 0 ? cleanup_errno : EBUSY;
+    return false;
+  }
   memset(&g_fakelib_mount, 0, sizeof(g_fakelib_mount));
   return true;
+}
+
+static void schedule_fakelib_cleanup(void) {
+  int cleanup_errno = errno;
+  if (runtime_sleep_mode_active() || should_stop_requested()) {
+    g_fakelib_mount.cleanup_next_us = 0;
+    return;
+  }
+  uint64_t now_us = monotonic_time_us();
+  if (cleanup_errno != EBUSY) {
+    g_fakelib_mount.cleanup_next_us = 0;
+    log_debug("  [FAKELIB] cleanup retained for %s: %s",
+              g_fakelib_mount.title_id, strerror(cleanup_errno));
+    return;
+  }
+  if (g_fakelib_mount.cleanup_deadline_us == 0 && now_us != 0) {
+    g_fakelib_mount.cleanup_deadline_us =
+        now_us + GAME_SANDBOX_CLEANUP_TIMEOUT_US;
+    log_debug("  [FAKELIB] busy sandbox cleanup scheduled: %s",
+              g_fakelib_mount.title_id);
+  }
+  if (now_us == 0 || now_us >= g_fakelib_mount.cleanup_deadline_us) {
+    g_fakelib_mount.cleanup_next_us = 0;
+    log_debug("  [FAKELIB] sandbox cleanup wait ended; retaining owned layers: %s",
+              g_fakelib_mount.title_id);
+    return;
+  }
+  uint64_t next_us = now_us + GAME_LIFECYCLE_POLL_INTERVAL_US;
+  bool needs_wake = g_fakelib_mount.cleanup_next_us == 0;
+  g_fakelib_mount.cleanup_next_us =
+      next_us < g_fakelib_mount.cleanup_deadline_us
+          ? next_us : g_fakelib_mount.cleanup_deadline_us;
+  if (needs_wake)
+    wake_game_lifecycle_watcher();
+}
+
+uint64_t sm_fakelib_game_next_cleanup_us(void) {
+  pthread_mutex_lock(&g_fakelib_mutex);
+  uint64_t next_us = g_fakelib_mount.cleanup_next_us;
+  pthread_mutex_unlock(&g_fakelib_mutex);
+  return next_us;
+}
+
+void sm_fakelib_game_poll_cleanup(void) {
+  pthread_mutex_lock(&g_fakelib_mutex);
+  if (runtime_sleep_mode_active() || should_stop_requested()) {
+    g_fakelib_mount.cleanup_next_us = 0;
+    pthread_mutex_unlock(&g_fakelib_mutex);
+    return;
+  }
+  uint64_t now_us = monotonic_time_us();
+  if (g_fakelib_mount.cleanup_next_us != 0 &&
+      (now_us == 0 || now_us >= g_fakelib_mount.cleanup_next_us)) {
+    if (!cleanup_fakelib_mount())
+      schedule_fakelib_cleanup();
+  }
+  pthread_mutex_unlock(&g_fakelib_mutex);
 }
 
 static bool cleanup_ppr_backport_fakelib(const char *title_id,
@@ -1717,6 +1990,22 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
     return false;
   }
 
+  // A confirmed EXEC owns this title's retained layers before any filesystem
+  // lookup. Supersede the dead/pre-spawn owner's retry even if app0 is gone.
+  if (pid > 0 && fakelib_session_active() &&
+      strcmp(g_fakelib_mount.title_id, title_id) == 0) {
+    g_fakelib_mount.pid = pid;
+    g_fakelib_mount.cleanup_next_us = 0;
+    g_fakelib_mount.cleanup_deadline_us = 0;
+  }
+
+  // Recheck under the session lock: a pre-spawn request may have waited behind
+  // suspend/shutdown cleanup after its service-side sleep check.
+  if (runtime_sleep_mode_active() || should_stop_requested()) {
+    errno = EBUSY;
+    return false;
+  }
+
   char managed_game_path[MAX_PATH] = {0};
   bool fakelib_enabled = sm_fakelib_game_feature_enabled() &&
                          !is_fakelib_excluded_for_title(title_id);
@@ -1775,9 +2064,11 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
   char global_source_path[MAX_PATH] = {0};
   const char *game_path = managed_title ? managed_game_path
                                         : sandbox_app0_path;
+  bool backport_source = false;
   fakelib_source_kind_t source_kind =
       fakelib_enabled ? resolve_game_fakelib_source_for_path(
-                            title_id, game_path, true, game_source_path)
+                            title_id, game_path, true, game_source_path,
+                            &backport_source)
                       : FAKELIB_SOURCE_NONE;
   bool has_game = source_kind != FAKELIB_SOURCE_NONE;
   bool allows_composition = source_kind != FAKELIB_SOURCE_FAKELIB2;
@@ -1831,15 +2122,16 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
     sandbox_resolved =
         resolve_sandbox_paths(title_id, sandbox_app0_path, mount_path);
   }
-  if (!sandbox_resolved || sandbox_app0_path[0] == '\0' ||
-      (has_source && mount_path[0] == '\0')) {
+  if (!sandbox_resolved)
+    return false;
+  if (sandbox_app0_path[0] == '\0' || (has_source && mount_path[0] == '\0')) {
     errno = ENOENT;
     return false;
   }
 
   if (fakelib_session_active()) {
-    log_debug("  [FAKELIB] handoff active mount pid=%ld -> pid=%ld (%s)",
-              (long)g_fakelib_mount.pid, (long)pid, title_id);
+    log_debug("  [FAKELIB] rebuilding sandbox mounts: %s pid=%ld",
+              title_id, (long)pid);
     if (!cleanup_fakelib_mount()) {
       log_debug("  [FAKELIB] handoff cleanup failed for pid=%ld, skipping %s",
                 (long)g_fakelib_mount.pid, title_id);
@@ -1865,7 +2157,8 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
       !mount_sandbox_storage_roots(title_id, sandbox_app0_path) ||
       !mount_sandbox_fonts(title_id, sandbox_app0_path)) {
     int mount_errno = errno;
-    (void)cleanup_fakelib_mount();
+    if (!cleanup_fakelib_mount())
+      schedule_fakelib_cleanup();
     errno = mount_errno;
     return false;
   }
@@ -1879,10 +2172,17 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
                      : (emulator_file_count > 0
                             ? SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED
                             : SM_L10N_GAME_BACKPORTED);
-  // Keep the original source for the deferred NOTE_EXEC notification as well.
+  // Capture the chosen origin before NOTE_EXEC: standalone backports show their
+  // root directory, while libraries from the game itself show just its title.
   (void)strlcpy(g_fakelib_mount.notification_target,
-                emulators_only ? title_id : original_source_path,
+                emulators_only || !backport_source ? title_id
+                                                  : original_source_path,
                 sizeof(g_fakelib_mount.notification_target));
+  if (backport_source && !emulators_only) {
+    char *separator = strrchr(g_fakelib_mount.notification_target, '/');
+    if (separator && separator != g_fakelib_mount.notification_target)
+      *separator = '\0';
+  }
   g_fakelib_mount.notify_pending = pid <= 0;
   if (notify_user)
     notify_system_info_l10n(g_fakelib_mount.notification,
@@ -1940,7 +2240,8 @@ void sm_fakelib_game_on_launch_failed(const char *title_id) {
   pthread_mutex_lock(&g_fakelib_mutex);
   if (fakelib_session_active() && g_fakelib_mount.pid <= 0 &&
       strcmp(g_fakelib_mount.title_id, title_id) == 0) {
-    (void)cleanup_fakelib_mount();
+    if (!cleanup_fakelib_mount())
+      schedule_fakelib_cleanup();
   }
   pthread_mutex_unlock(&g_fakelib_mutex);
 }
@@ -1951,14 +2252,6 @@ void sm_fakelib_game_on_exec(pid_t pid, const char *title_id,
     return;
 
   pthread_mutex_lock(&g_fakelib_mutex);
-  if (fakelib_session_active() && g_fakelib_mount.mounts_ready &&
-      g_fakelib_mount.pid == pid) {
-    log_debug("  [FAKELIB] already tracking pid=%ld for %s", (long)pid,
-              title_id);
-    pthread_mutex_unlock(&g_fakelib_mutex);
-    return;
-  }
-
   (void)mount_fakelib_for_game_locked(pid, title_id, notify_user);
   pthread_mutex_unlock(&g_fakelib_mutex);
 }
@@ -1973,12 +2266,15 @@ void sm_fakelib_game_on_exit(pid_t pid) {
   log_debug("  [FAKELIB] game stopped: pid=%ld title=%s layers=%u",
             (long)pid, g_fakelib_mount.title_id,
             (unsigned)g_fakelib_mount.layer_count);
-  cleanup_fakelib_mount();
+  if (!cleanup_fakelib_mount())
+    schedule_fakelib_cleanup();
   pthread_mutex_unlock(&g_fakelib_mutex);
 }
 
 void sm_fakelib_game_shutdown(void) {
   pthread_mutex_lock(&g_fakelib_mutex);
   (void)cleanup_fakelib_mount();
+  g_fakelib_mount.cleanup_next_us = 0;
+  g_fakelib_mount.cleanup_deadline_us = 0;
   pthread_mutex_unlock(&g_fakelib_mutex);
 }

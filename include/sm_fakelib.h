@@ -28,6 +28,10 @@ void sm_fakelib_game_on_exec(pid_t pid, const char *title_id,
                              bool notify_user);
 // Remove tracked sandbox mounts for a stopped game.
 void sm_fakelib_game_on_exit(pid_t pid);
+// Bounded cleanup of busy owned mounts, driven by the shared lifecycle watcher.
+// A zero deadline means no automatic cleanup is scheduled.
+uint64_t sm_fakelib_game_next_cleanup_us(void);
+void sm_fakelib_game_poll_cleanup(void);
 // Unmount all tracked overlays during watcher shutdown.
 void sm_fakelib_game_shutdown(void);
 
