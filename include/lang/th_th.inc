@@ -14,10 +14,10 @@ static const char *const g_th_th[SM_L10N_COUNT] = {
     [SM_L10N_BACKPORT_OVERLAY_FAILED] = "backport overlay ล้มเหลว: %s\n%s\n0x%08X",
     /* English: Emulators applied to game: %s */
     [SM_L10N_GAME_EMULATORS_APPLIED] = "ใช้โปรแกรมจำลองกับเกม %s แล้ว",
-    /* English: Backport applied to game: %s */
-    [SM_L10N_GAME_BACKPORTED] = "ใช้ backport กับเกมแล้ว: %s",
-    /* English: Backport applied to game: %s\nEmulators updated */
-    [SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED] = "ใช้ backport กับเกมแล้ว: %s\nอัปเดตอีมูเลเตอร์หลายตัวแล้ว",
+    /* English: Backport applied: %s */
+    [SM_L10N_GAME_BACKPORTED] = "ใช้ backport แล้ว: %s",
+    /* English: Backport applied: %s\nEmulators updated */
+    [SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED] = "ใช้ backport แล้ว: %s\nอัปเดตอีมูเลเตอร์หลายตัวแล้ว",
     /* English: Image mount rejected:\n%s\nCluster size is too small (%llu < %u).\nSaved image_sector override: %u.\nTry mounting again. */
     [SM_L10N_IMAGE_REJECTED_CLUSTER_AUTOTUNED] = "ปฏิเสธการเมานต์อิมเมจ:\n%s\nขนาดคลัสเตอร์เล็กเกินไป (%llu < %u)\nบันทึกค่า image_sector แล้ว: %u\nลองเมานต์อีกครั้ง",
     /* English: Image mount rejected:\n%s\nCluster size is too small (%llu < %u).\nUse a larger cluster size in the image or lower sector size in config. */

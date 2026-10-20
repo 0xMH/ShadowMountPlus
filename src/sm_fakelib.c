@@ -51,6 +51,7 @@ typedef struct {
   fakelib_layer_t layers[7u + SANDBOX_USB_ROOT_COUNT + SANDBOX_EXT_ROOT_COUNT];
   size_t layer_count;
   sm_l10n_key_t notification;
+  char notification_target[MAX_PATH];
   bool notify_pending;
   bool mounts_ready;
 } fakelib_session_t;
@@ -1746,7 +1747,8 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
       if (pid > 0)
         g_fakelib_mount.notify_pending = false;
       if (notify) {
-        notify_system_info_l10n(g_fakelib_mount.notification, title_id);
+        notify_system_info_l10n(g_fakelib_mount.notification,
+                               g_fakelib_mount.notification_target);
       }
       return true;
     }
@@ -1784,19 +1786,22 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
   bool needs_combined_cache =
       has_global && has_game &&
       strcmp(global_source_path, game_source_path) != 0;
+  bool has_source = has_game || has_global;
+  const char *original_source_path =
+      has_game ? game_source_path : global_source_path;
+  const char *source_path = original_source_path;
   size_t emulator_file_count = 0;
   bool cache_resolved = false;
   bool cache_includes_global = false;
-  if (has_game || has_global) {
-    char cache_path[MAX_PATH];
+  char cache_path[MAX_PATH];
+  if (has_source) {
     bool required = false;
     cache_resolved = resolve_cached_fakelib(
-        title_id, has_game ? game_source_path : global_source_path,
+        title_id, original_source_path,
         managed_title, cache_path,
         &emulator_file_count, &cache_includes_global, !allows_composition, &required);
     if (cache_resolved) {
-      (void)strlcpy(has_game ? game_source_path : global_source_path,
-                    cache_path, MAX_PATH);
+      source_path = cache_path;
       log_debug("  [FAKELIB] using cache for %s: %s", title_id,
                 cache_path);
     } else if (required) {
@@ -1813,9 +1818,7 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
               title_id);
   }
 
-  bool has_source = has_game || has_global;
   bool emulators_only = false;
-  const char *source_path = has_game ? game_source_path : global_source_path;
   if (has_source) {
     bool has_files;
     if (!fakelib_content_profile(source_path, &has_files, &emulators_only))
@@ -1850,13 +1853,6 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
                 sizeof(g_fakelib_mount.sandbox_app0_path));
   (void)strlcpy(g_fakelib_mount.mount_path, mount_path,
                 sizeof(g_fakelib_mount.mount_path));
-  g_fakelib_mount.notification =
-      emulators_only ? SM_L10N_GAME_EMULATORS_APPLIED
-                     : (emulator_file_count > 0
-                            ? SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED
-                            : SM_L10N_GAME_BACKPORTED);
-  bool notify_applied = has_source && (has_game || emulators_only);
-  g_fakelib_mount.notify_pending = notify_applied && pid <= 0;
   const char *label = !allows_composition
                           ? "fakelib2"
                           : (has_game ? "game" : "global");
@@ -1873,8 +1869,22 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
   }
   g_fakelib_mount.mounts_ready = true;
 
-  if (notify_applied && notify_user)
-    notify_system_info_l10n(g_fakelib_mount.notification, title_id);
+  if (!has_source || (!has_game && !emulators_only))
+    return true;
+
+  g_fakelib_mount.notification =
+      emulators_only ? SM_L10N_GAME_EMULATORS_APPLIED
+                     : (emulator_file_count > 0
+                            ? SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED
+                            : SM_L10N_GAME_BACKPORTED);
+  // Keep the original source for the deferred NOTE_EXEC notification as well.
+  (void)strlcpy(g_fakelib_mount.notification_target,
+                emulators_only ? title_id : original_source_path,
+                sizeof(g_fakelib_mount.notification_target));
+  g_fakelib_mount.notify_pending = pid <= 0;
+  if (notify_user)
+    notify_system_info_l10n(g_fakelib_mount.notification,
+                           g_fakelib_mount.notification_target);
   return true;
 }
 
