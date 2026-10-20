@@ -708,7 +708,7 @@ static bool resolve_global_fakelib_source(const char *title_id,
   const runtime_config_t cfg = runtime_config();
   if (!cfg.global_fakelib_enabled)
     return false;
-  if (is_global_fakelib_excluded_for_title(title_id))
+  if (sm_config_title_global_fakelib_excluded(&cfg, title_id))
     return false;
 
   struct stat st;

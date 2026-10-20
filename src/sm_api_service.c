@@ -1131,6 +1131,8 @@ static struct json_object *game_to_json(
       !add_json_bool(item, "can_uninstall", installed) ||
       !add_json_bool(item, "can_manage_source", !installed_pkg) ||
       !add_json_bool(item, "can_toggle_fakelib", can_toggle_fakelib) ||
+      !add_json_bool(item, "ignore_global_fakelib",
+                     sm_config_title_global_fakelib_excluded(cfg, source->title_id)) ||
       !add_json_bool(item, "fakelib_enabled", fakelib_enabled) ||
       !add_json_string(item, "fakelib_mode",
                        sm_config_fakelib_mode_name(fakelib_mode)) ||
@@ -2277,21 +2279,31 @@ static void handle_uninstall(struct MHD_Connection *fd,
 static void handle_game_fakelib(struct MHD_Connection *connection,
                                  struct json_object *request) {
   const char *title_id = get_title_id(request);
-  sm_fakelib_mode_t mode;
+  sm_fakelib_mode_t mode = SM_FAKELIB_DEFAULT;
   struct json_object *mode_value = NULL;
-  bool valid_mode;
-  if (json_object_object_get_ex(request, "mode", &mode_value)) {
-    valid_mode = json_object_is_type(mode_value, json_type_string) &&
-                 sm_config_parse_fakelib_mode(
-                     json_object_get_string(mode_value), &mode);
+  struct json_object *global_value = NULL;
+  bool update_global = json_object_object_get_ex(request, "ignore_global_fakelib",
+                                                 &global_value);
+  bool global_excluded = false;
+  bool valid_policy;
+  if (update_global) {
+    valid_policy = json_object_is_type(global_value, json_type_boolean) &&
+                   !json_object_object_get_ex(request, "mode", &mode_value) &&
+                   !json_object_object_get_ex(request, "enabled", &mode_value);
+    global_excluded = json_object_get_boolean(global_value);
+  } else if (json_object_object_get_ex(request, "mode", &mode_value)) {
+    valid_policy = json_object_is_type(mode_value, json_type_string) &&
+                   sm_config_parse_fakelib_mode(
+                       json_object_get_string(mode_value), &mode);
   } else {
     bool enabled = false;
-    valid_mode = get_required_bool(request, "enabled", &enabled);
+    valid_policy = get_required_bool(request, "enabled", &enabled);
     mode = enabled ? SM_FAKELIB_FULL : SM_FAKELIB_DISABLED;
   }
-  if (!title_id || !valid_mode) {
+  if (!title_id || !valid_policy) {
     send_error_response(connection, 400, EINVAL,
-                        "title_id and mode (default, full, emulators, disabled) are required");
+                        "title_id and a valid fakelib setting are required; "
+                        "ignore_global_fakelib cannot be combined with mode or enabled");
     return;
   }
   if (strncmp(title_id, "PPSA", 4u) != 0) {
@@ -2321,7 +2333,10 @@ static void handle_game_fakelib(struct MHD_Connection *connection,
                         strerror(status));
     return;
   }
-  if (!sm_config_set_title_fakelib_mode(title_id, mode)) {
+  bool saved = update_global
+                   ? sm_config_set_title_global_fakelib_excluded(title_id, global_excluded)
+                   : sm_config_set_title_fakelib_mode(title_id, mode);
+  if (!saved) {
     int status = errno != 0 ? errno : EIO;
     send_error_response(connection, operation_http_status(status), status,
                         strerror(status));
@@ -2333,12 +2348,15 @@ static void handle_game_fakelib(struct MHD_Connection *connection,
   struct json_object *response = new_status_response(0);
   if (!response || !add_json_string(response, "title_id", title_id) ||
       !add_json_bool(response, "fakelib_enabled", enabled) ||
+      !add_json_bool(response, "ignore_global_fakelib",
+                     sm_config_title_global_fakelib_excluded(&cfg, title_id)) ||
       !add_json_string(response, "fakelib_mode",
                        sm_config_fakelib_mode_name(effective_mode)) ||
       !add_json_string(response, "fakelib_default_mode",
                        sm_config_fakelib_mode_name(cfg.fakelib_default_mode)) ||
       !add_json_string(response, "fakelib_mode_override",
-                       sm_config_fakelib_mode_name(mode)) ||
+                       sm_config_fakelib_mode_name(
+                           sm_config_title_fakelib_override(&cfg, title_id))) ||
       !add_json_bool(response, "fakelib_effective_enabled",
                      enabled && cfg.backport_fakelib_enabled) ||
       !add_json_bool(response, "saved", true) ||
