@@ -438,12 +438,14 @@ static bool try_collect_candidate_for_directory(
 
   note_found_title(info.title_id);
 
-  note_game_cache_source_seen(full_path, info.title_id, info.title_name);
-
   if (!sm_image_index_record_game(full_path, info.title_id) &&
       unstable_found_out) {
     *unstable_found_out = true;
   }
+  if (sm_shellcore_title_is_protected(info.title_id))
+    return true;
+
+  note_game_cache_source_seen(full_path, info.title_id, info.title_name);
 
   int duplicate_candidate_index = find_scan_candidate_index_by_title_id(
       candidates, *candidate_count, info.title_id);
@@ -525,6 +527,8 @@ static void collect_scan_candidates_from_manual_root(
 
 static sm_scan_tree_dir_visit_t collect_candidate_directory_visit(
     const char *dir_path, unsigned int depth_from_root, void *ctx_ptr) {
+  if (!sm_game_lifecycle_background_title(NULL))
+    return SM_SCAN_TREE_DIR_ABORT;
   if (depth_from_root == 0u)
     return SM_SCAN_TREE_DIR_DESCEND;
 
@@ -549,6 +553,8 @@ static bool collect_candidate_image_visit(const char *image_path,
                                           unsigned int depth_from_root,
                                           void *ctx_ptr) {
   (void)depth_from_root;
+  if (!sm_game_lifecycle_background_title(NULL))
+    return false;
 
   collect_candidates_walk_ctx_t *ctx = (collect_candidates_walk_ctx_t *)ctx_ptr;
   if (defer_full_candidate_batch(*ctx->candidate_count, ctx->max_candidates,
@@ -904,13 +910,11 @@ bool mount_backport_overlay_for_title(const char *source_path,
 bool release_scan_runtime_mounts(void) {
   if (runtime_sleep_mode_active())
     return false;
-  if (sm_game_lifecycle_has_active_game() ||
-      sm_shellcore_service_has_prepared_mount()) {
+  if (sm_shellcore_background_work_blocked()) {
     return true;
   }
   runtime_mount_state_lock();
-  if (sm_game_lifecycle_has_active_game() ||
-      sm_shellcore_service_has_prepared_mount()) {
+  if (sm_shellcore_background_work_blocked()) {
     runtime_mount_state_unlock();
     return true;
   }

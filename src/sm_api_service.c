@@ -1654,10 +1654,9 @@ static bool add_scan_queue_fields(struct json_object *response, bool queued) {
   if (queued) {
     if (runtime_sleep_mode_active())
       reason = "rest_mode";
-    else if (sm_game_lifecycle_has_active_game())
-      reason = "game_active";
-    else if (sm_shellcore_service_has_prepared_mount())
-      reason = "runtime_prepared";
+    else if (sm_shellcore_background_work_blocked())
+      reason = sm_game_lifecycle_has_active_game() ? "game_active"
+                                                  : "runtime_prepared";
   }
   return add_json_bool(response, "scan_queued", queued) &&
          add_json_bool(response, "scan_deferred", reason[0] != '\0') &&
@@ -2135,7 +2134,8 @@ static void handle_kernel_log(struct MHD_Connection *connection,
 static const char *runtime_mutation_block_reason(void) {
   if (runtime_sleep_mode_active())
     return "rest_mode";
-  if (sm_game_lifecycle_has_active_game())
+  if (sm_game_lifecycle_has_active_game() &&
+      sm_shellcore_background_work_blocked())
     return "game_active";
   if (sm_install_has_pending_work())
     return "install_pending";
@@ -2170,6 +2170,10 @@ static int request_game_uninstall(const char *title_id,
   *error_out = runtime_mutation_block_reason();
   if (*error_out)
     return EBUSY;
+  if (sm_shellcore_title_is_protected(title_id)) {
+    *error_out = "game_active";
+    return EBUSY;
+  }
   sm_game_cache_snapshot_entry_t package;
   bool installed_pkg = find_installed_pkg_game(title_id, &package);
   if (!installed_pkg && errno != ENOENT)
@@ -2178,12 +2182,21 @@ static int request_game_uninstall(const char *title_id,
     return ENOENT;
 
   bool title_prepared = sm_shellcore_service_title_is_prepared(title_id);
-  if (sm_shellcore_service_has_prepared_mount() && !title_prepared) {
+  if (sm_shellcore_service_has_prepared_mount() && !title_prepared &&
+      sm_shellcore_background_work_blocked()) {
     *error_out = "runtime_prepared";
     return EBUSY;
   }
   if (!installed_pkg && (title_prepared || is_data_mounted(title_id))) {
-    int release_status = sm_shellcore_unmount_title_runtime(title_id);
+    int release_status;
+    if (!title_prepared && sm_game_lifecycle_has_active_game()) {
+      runtime_mount_state_lock();
+      bool released = unmount_title_runtime_layers(title_id);
+      release_status = released ? 0 : (errno != 0 ? errno : EIO);
+      runtime_mount_state_unlock();
+    } else {
+      release_status = sm_shellcore_unmount_title_runtime(title_id);
+    }
     if (release_status != 0) {
       if (release_status == EBUSY)
         *error_out = "title_unmount_busy";
@@ -2507,8 +2520,13 @@ static int release_storage_source_runtime(const char *physical_path,
   *error_out = runtime_mutation_block_reason();
   if (*error_out)
     return EBUSY;
-  if (sm_shellcore_service_has_prepared_mount()) {
+  if (sm_shellcore_background_work_blocked()) {
     *error_out = "runtime_prepared";
+    return EBUSY;
+  }
+  if (sm_shellcore_title_is_protected(title_id) ||
+      sm_shellcore_source_is_protected(physical_path)) {
+    *error_out = "game_active";
     return EBUSY;
   }
 
@@ -2928,6 +2946,14 @@ static void *storage_job_thread_main(void *arg) {
   if (status == 0 && storage_job_cancelled(job_ctx))
     status = ECANCELED;
 
+  if (status == 0 &&
+      (sm_shellcore_title_is_protected(title_id) ||
+       sm_shellcore_source_is_protected(source) ||
+       sm_shellcore_source_is_protected(destination))) {
+    status = EBUSY;
+    error = "game_active";
+  }
+
   if (status == 0) {
     pthread_mutex_lock(&g_storage_job.mutex);
     if (g_storage_job.id != job_id || g_storage_job.cancel_requested)
@@ -3099,6 +3125,12 @@ static int start_storage_job(const char *title_id,
                                        source_info.physical_path, destination);
     if (destination_status != 0)
       return destination_status;
+  }
+  if (sm_shellcore_title_is_protected(title_id) ||
+      sm_shellcore_source_is_protected(source_info.physical_path) ||
+      sm_shellcore_source_is_protected(destination)) {
+    *error_out = "game_active";
+    return EBUSY;
   }
 
   pthread_mutex_lock(&g_storage_job.mutex);

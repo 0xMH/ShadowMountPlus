@@ -1,4 +1,5 @@
 #include "sm_platform.h"
+#include "sm_shellcore_service.h"
 
 #include "sm_fakelib.h"
 #include "sm_config_mount.h"
@@ -1073,6 +1074,8 @@ static bool cache_root_is_mounted(const char *cache_root) {
 }
 
 static void remove_title_cache(const char *title_id) {
+  if (sm_shellcore_title_is_protected(title_id))
+    return;
   char cache_root[MAX_PATH];
   if (!build_cache_path(title_id, "", cache_root))
     return;
@@ -1321,6 +1324,8 @@ static void cleanup_expired_fakelib_caches(uint64_t now_sec) {
     char temporary_title_id[MAX_TITLE_ID];
     if (parse_temporary_cache_title_id(entry->d_name,
                                        temporary_title_id)) {
+      if (sm_shellcore_title_is_protected(temporary_title_id))
+        continue;
       char temporary_root[MAX_PATH];
       if (build_cache_path(temporary_title_id, ".tmp", temporary_root)) {
         if (remove_cache_tree(temporary_root)) {
@@ -1336,6 +1341,8 @@ static void cleanup_expired_fakelib_caches(uint64_t now_sec) {
     if (!is_supported_game_title_id(entry->d_name)) {
       continue;
     }
+    if (sm_shellcore_title_is_protected(entry->d_name))
+      continue;
 
     char cache_root[MAX_PATH];
     if (!build_cache_path(entry->d_name, "", cache_root))

@@ -63,10 +63,23 @@ static bool g_game_lifecycle_start_ready = false;
 static bool g_game_lifecycle_start_success = false;
 static _Atomic pid_t g_active_game_pid = 0;
 static _Atomic bool g_game_exit_handoff_pending = false;
+// One atomic snapshot for background policy and the protected live title.
+// The lifecycle thread remains the only publisher.
+#define GAME_BACKGROUND_IDLE 0u
+#define GAME_BACKGROUND_BLOCKED 1u
+#define GAME_BACKGROUND_TITLE_BASE 2u
+#define GAME_BACKGROUND_TITLE_RANGE 100000u
+#define GAME_BACKGROUND_TITLE_BLOCKED (UINT32_C(1) << 31)
+#define GAME_APP_FOCUS_KNOWN (UINT64_C(1) << 32)
+#define GAME_APP_FOCUS_PENDING (UINT64_C(1) << 33)
+static const char g_background_title_prefixes[][5] = {
+    "FAKE", "LAPY", "PPSA", "CUSA"};
+static _Atomic uint32_t g_background_game_state = GAME_BACKGROUND_IDLE;
 static uint32_t g_active_game_app_id = 0;
 static pending_game_exit_t g_pending_game_exit;
-static _Atomic uint32_t g_pending_app_focus_id;
-static _Atomic bool g_pending_app_focus_valid;
+// Retain the last focus after consumption; publish its identity and validity
+// together so a concurrent update cannot combine two different observations.
+static _Atomic uint64_t g_app_focus_state;
 // Title storage is owned exclusively by the lifecycle thread. Other threads
 // consume only atomically published state through public helpers.
 static char g_active_game_title_id[MAX_TITLE_ID];
@@ -83,23 +96,62 @@ static bool published_game_active(pid_t pid, bool handoff_pending) {
   return pid > 0 || handoff_pending;
 }
 
+static void publish_background_game_state(bool was_active) {
+  pid_t pid = atomic_load(&g_active_game_pid);
+  bool pending = atomic_load(&g_game_exit_handoff_pending);
+  bool active = published_game_active(pid, pending);
+  uint32_t state = active ? GAME_BACKGROUND_BLOCKED : GAME_BACKGROUND_IDLE;
+  const char *title = g_active_game_title_id;
+  uint64_t focus = atomic_load(&g_app_focus_state);
+  bool background = g_active_game_app_id != 0 &&
+      (focus & GAME_APP_FOCUS_KNOWN) != 0 &&
+      (uint32_t)focus != g_active_game_app_id;
+  size_t prefix_count = sizeof(g_background_title_prefixes) /
+                        sizeof(g_background_title_prefixes[0]);
+  size_t prefix = 0;
+  while (prefix < prefix_count &&
+         strncmp(title, g_background_title_prefixes[prefix], 4u) != 0)
+    ++prefix;
+  if (pid > 0 && strlen(title) == 9u && prefix < prefix_count) {
+    uint32_t number = 0;
+    bool valid = true;
+    for (size_t i = 4u; i < 9u; ++i) {
+      if (title[i] < '0' || title[i] > '9') {
+        valid = false;
+        break;
+      }
+      number = number * 10u + (uint32_t)(title[i] - '0');
+    }
+    if (valid) {
+      state = GAME_BACKGROUND_TITLE_BASE +
+              (uint32_t)prefix * GAME_BACKGROUND_TITLE_RANGE + number;
+      if (pending || (prefix >= 2u && !background))
+        state |= GAME_BACKGROUND_TITLE_BLOCKED;
+    }
+  }
+  uint32_t previous = atomic_exchange(&g_background_game_state, state);
+  bool was_blocked = previous == GAME_BACKGROUND_BLOCKED ||
+                     (previous & GAME_BACKGROUND_TITLE_BLOCKED) != 0;
+  bool blocked = state == GAME_BACKGROUND_BLOCKED ||
+                 (state & GAME_BACKGROUND_TITLE_BLOCKED) != 0;
+  if (was_active != active || was_blocked != blocked ||
+      (!blocked && previous != state))
+    sm_scanner_wake();
+}
+
 static void publish_active_game_pid(pid_t pid) {
   pid_t previous_pid = atomic_exchange(&g_active_game_pid, pid);
   bool handoff_pending = atomic_load(&g_game_exit_handoff_pending);
-  if (published_game_active(previous_pid, handoff_pending) !=
-      published_game_active(pid, handoff_pending)) {
-    sm_scanner_wake();
-  }
+  publish_background_game_state(
+      published_game_active(previous_pid, handoff_pending));
 }
 
 static void publish_game_exit_handoff_pending(bool pending) {
   bool previous_pending =
       atomic_exchange(&g_game_exit_handoff_pending, pending);
   pid_t active_pid = atomic_load(&g_active_game_pid);
-  if (published_game_active(active_pid, previous_pending) !=
-      published_game_active(active_pid, pending)) {
-    sm_scanner_wake();
-  }
+  publish_background_game_state(
+      published_game_active(active_pid, previous_pending));
 }
 
 static void publish_active_game(pid_t pid, const char *title_id,
@@ -129,16 +181,18 @@ static bool consume_active_game(pid_t pid, char title_id_out[MAX_TITLE_ID],
 }
 
 static void handle_pending_app_focus(void) {
-  if (!atomic_exchange(&g_pending_app_focus_valid, false))
+  uint64_t focus = atomic_fetch_and(&g_app_focus_state, ~GAME_APP_FOCUS_PENDING);
+  if ((focus & GAME_APP_FOCUS_PENDING) == 0)
     return;
 
-  uint32_t focused_app_id = atomic_load(&g_pending_app_focus_id);
   if (atomic_load(&g_active_game_pid) <= 0 || g_active_game_app_id == 0 ||
       g_active_game_title_id[0] == '\0') {
-    atomic_store(&g_pending_app_focus_valid, true);
+    atomic_fetch_or(&g_app_focus_state, GAME_APP_FOCUS_PENDING);
     return;
   }
-  if (focused_app_id == 0 || focused_app_id != g_active_game_app_id)
+  publish_background_game_state(sm_game_lifecycle_has_active_game());
+  if ((focus & GAME_APP_FOCUS_KNOWN) == 0 ||
+      (uint32_t)focus != g_active_game_app_id)
     return;
 
   sm_fan_apply_game_target(g_active_game_title_id);
@@ -1234,8 +1288,7 @@ bool start_game_lifecycle_watcher(void) {
 
   atomic_store_explicit(&g_game_lifecycle_stop_requested, false,
                         memory_order_relaxed);
-  atomic_store(&g_pending_app_focus_id, 0);
-  atomic_store(&g_pending_app_focus_valid, false);
+  atomic_store(&g_app_focus_state, 0);
   clear_pending_game_exit();
   pthread_mutex_lock(&g_game_lifecycle_start_mutex);
   g_game_lifecycle_wake_pipe[0] = wake_pipe[0];
@@ -1300,8 +1353,7 @@ void stop_game_lifecycle_watcher(void) {
   g_game_lifecycle_thread_started = false;
   atomic_store_explicit(&g_game_lifecycle_stop_requested, false,
                         memory_order_relaxed);
-  atomic_store(&g_pending_app_focus_id, 0);
-  atomic_store(&g_pending_app_focus_valid, false);
+  atomic_store(&g_app_focus_state, 0);
   publish_active_game(0, NULL, 0);
   close_game_lifecycle_wake_pipe();
 }
@@ -1311,10 +1363,39 @@ bool sm_game_lifecycle_has_active_game(void) {
          atomic_load(&g_game_exit_handoff_pending);
 }
 
-void sm_game_lifecycle_note_app_focus(uint32_t app_id) {
-  atomic_store(&g_pending_app_focus_id, app_id);
-  atomic_store(&g_pending_app_focus_valid, true);
+bool sm_game_lifecycle_background_title(char title_id[MAX_TITLE_ID]) {
+  uint32_t state = atomic_load(&g_background_game_state);
+  bool allowed = state != GAME_BACKGROUND_BLOCKED &&
+                 (state & GAME_BACKGROUND_TITLE_BLOCKED) == 0;
+  if (title_id)
+    title_id[0] = '\0';
+  if (state == GAME_BACKGROUND_BLOCKED || state == GAME_BACKGROUND_IDLE ||
+      !title_id)
+    return allowed;
+  uint32_t identity =
+      (state & ~GAME_BACKGROUND_TITLE_BLOCKED) - GAME_BACKGROUND_TITLE_BASE;
+  (void)snprintf(title_id, MAX_TITLE_ID, "%s%05u",
+                 g_background_title_prefixes[identity / GAME_BACKGROUND_TITLE_RANGE],
+                 identity % GAME_BACKGROUND_TITLE_RANGE);
+  return allowed;
+}
+
+static void publish_app_focus(uint64_t focus) {
+  // The flag monitor is the only producer; the lifecycle consumer clears only
+  // PENDING, keeping this comparison stable across consumption.
+  uint64_t previous = atomic_load(&g_app_focus_state);
+  if ((previous & ~GAME_APP_FOCUS_PENDING) == focus)
+    return;
+  atomic_store(&g_app_focus_state, focus | GAME_APP_FOCUS_PENDING);
   wake_game_lifecycle_watcher();
+}
+
+void sm_game_lifecycle_note_app_focus(uint32_t app_id) {
+  publish_app_focus(GAME_APP_FOCUS_KNOWN | app_id);
+}
+
+void sm_game_lifecycle_invalidate_app_focus(void) {
+  publish_app_focus(0);
 }
 
 bool refresh_game_lifecycle_watcher(void) {

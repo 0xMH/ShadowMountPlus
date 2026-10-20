@@ -73,6 +73,11 @@ static shellcore_service_state_t g_service = {
 #define SHELLCORE_RELEASE_MAX_ATTEMPTS 5u
 #define SHELLCORE_RELEASE_RETRY_DELAY_US 150000u
 
+static bool launch_preparation_pending_locked(void) {
+  return g_service.prepare_in_progress || g_service.launch_pending ||
+         g_service.pending_launch_title_id[0] != '\0';
+}
+
 static bool mount_owner_matches(const shellcore_mount_owner_t *owner,
                                 const char *title_id) {
   return owner->title_id[0] != '\0' && strcmp(owner->title_id, title_id) == 0;
@@ -104,6 +109,7 @@ static int claim_prepared_title(const char *title_id, bool launch_request,
   if (claimed_out)
     *claimed_out = false;
   pthread_mutex_lock(&g_service.mutex);
+  bool was_busy = launch_preparation_pending_locked();
   if (g_service.prepare_in_progress ||
       g_service.external_mutation_in_progress ||
       strcmp(g_service.releasing_title_id, title_id) == 0) {
@@ -141,6 +147,7 @@ static int claim_prepared_title(const char *title_id, bool launch_request,
     if (launch_request)
       g_service.launch_pending = true;
   }
+  changed |= was_busy != launch_preparation_pending_locked();
   pthread_mutex_unlock(&g_service.mutex);
   if (changed)
     sm_scanner_wake();
@@ -189,12 +196,16 @@ static void rollback_prepared_title(const char *title_id) {
 static void finish_prepared_title(const char *title_id,
                                   bool cancel_launch) {
   pthread_mutex_lock(&g_service.mutex);
+  bool was_busy = launch_preparation_pending_locked();
   if (mount_owner_matches(&g_service.prepared, title_id)) {
     g_service.prepare_in_progress = false;
     if (cancel_launch)
       g_service.launch_pending = false;
   }
+  bool changed = was_busy != launch_preparation_pending_locked();
   pthread_mutex_unlock(&g_service.mutex);
+  if (changed)
+    sm_scanner_wake();
 }
 
 static int begin_runtime_release(const char *title_id, bool public_request,
@@ -496,6 +507,7 @@ bool sm_shellcore_ensure_title_runtime(const char *title_id) {
 
 static int handle_launch_request(const char *title_id) {
   pthread_mutex_lock(&g_service.mutex);
+  bool was_busy = launch_preparation_pending_locked();
   g_service.pending_launch_title_id[0] = '\0';
   g_service.pending_sandbox_ready_handled = false;
   if (is_supported_game_title_id(title_id)) {
@@ -504,7 +516,10 @@ static int handle_launch_request(const char *title_id) {
     if (mount_owner_matches(&g_service.prepared, title_id))
       g_service.prepared.sandbox_ready_handled = false;
   }
+  bool changed = was_busy != launch_preparation_pending_locked();
   pthread_mutex_unlock(&g_service.mutex);
+  if (changed)
+    sm_scanner_wake();
 
   int status = mount_managed_title_runtime(title_id, false, true, NULL);
   if (status != 0) {
@@ -512,12 +527,16 @@ static int handle_launch_request(const char *title_id) {
     // Stock titles still need their pending identity for sandbox-ready.
     if (status != ENOENT && status != EINVAL) {
       pthread_mutex_lock(&g_service.mutex);
+      was_busy = launch_preparation_pending_locked();
       if (!g_service.prepare_in_progress && !g_service.launch_pending &&
           strcmp(g_service.pending_launch_title_id, title_id) == 0) {
         g_service.pending_launch_title_id[0] = '\0';
         g_service.pending_sandbox_ready_handled = false;
       }
+      changed = was_busy != launch_preparation_pending_locked();
       pthread_mutex_unlock(&g_service.mutex);
+      if (changed)
+        sm_scanner_wake();
     }
     // The launch hook also observes stock games and ShellCore system apps.
     // ENOENT/EINVAL mean "not managed here", not a runtime mount failure.
@@ -681,6 +700,7 @@ bool sm_shellcore_service_bind_prepared_app(const char *title_id,
     pthread_mutex_unlock(&g_service.mutex);
     return false;
   }
+  bool was_busy = launch_preparation_pending_locked();
   if (owner) {
     owner->app_id = app_id;
     owner->pid = pid;
@@ -695,7 +715,10 @@ bool sm_shellcore_service_bind_prepared_app(const char *title_id,
     g_service.pending_launch_title_id[0] = '\0';
     g_service.pending_sandbox_ready_handled = false;
   }
+  bool changed = was_busy != launch_preparation_pending_locked();
   pthread_mutex_unlock(&g_service.mutex);
+  if (changed)
+    sm_scanner_wake();
   return true;
 }
 
@@ -846,10 +869,115 @@ bool sm_shellcore_service_has_prepared_mount(void) {
   return prepared;
 }
 
+bool sm_shellcore_background_work_blocked(void) {
+  char title_id[MAX_TITLE_ID];
+  if (!sm_game_lifecycle_background_title(title_id))
+    return true;
+  pthread_mutex_lock(&g_service.mutex);
+  bool blocked = g_service.stop_requested ||
+      launch_preparation_pending_locked() ||
+      g_service.releasing_title_id[0] != '\0' ||
+      g_service.outgoing.title_id[0] != '\0' ||
+      (g_service.prepared.title_id[0] != '\0' &&
+       (strcmp(g_service.prepared.title_id, title_id) != 0 ||
+        g_service.prepared.pid <= 0 || g_service.prepared.game_exited));
+  bool managed = g_service.prepared.title_id[0] != '\0';
+  pthread_mutex_unlock(&g_service.mutex);
+  if (blocked || title_id[0] == '\0')
+    return blocked;
+
+  char runtime_path[MAX_PATH];
+  char chain[MAX_IMAGE_CHAIN_DEPTH][MAX_PATH];
+  size_t count = 0;
+  // Never permit cleanup with an unknown backing chain for an active image.
+  if (!read_mount_link(title_id, runtime_path, sizeof(runtime_path)))
+    return managed;
+  return is_under_image_mount_base(runtime_path) &&
+         (!read_mount_image_chain(title_id, chain, &count) || count == 0);
+}
+
+static size_t snapshot_protected_titles(char titles[3][MAX_TITLE_ID]) {
+  if (runtime_sleep_mode_active() || should_stop_requested())
+    return 0;
+  size_t count = 0;
+  char background_title[MAX_TITLE_ID];
+  (void)sm_game_lifecycle_background_title(background_title);
+  if (background_title[0] != '\0') {
+    (void)strlcpy(titles[count++], background_title, MAX_TITLE_ID);
+  }
+  pthread_mutex_lock(&g_service.mutex);
+  if (g_service.stop_requested) {
+    pthread_mutex_unlock(&g_service.mutex);
+    return 0;
+  }
+  const shellcore_mount_owner_t *owners[] = {&g_service.prepared,
+                                            &g_service.outgoing};
+  for (size_t i = 0; i < 2u; ++i) {
+    const shellcore_mount_owner_t *owner = owners[i];
+    if (!owner->title_id[0] || owner->game_exited || owner->pid <= 0)
+      continue;
+    bool duplicate = false;
+    for (size_t j = 0; j < count; ++j)
+      duplicate |= strcmp(titles[j], owner->title_id) == 0;
+    if (!duplicate)
+      (void)strlcpy(titles[count++], owner->title_id, MAX_TITLE_ID);
+  }
+  pthread_mutex_unlock(&g_service.mutex);
+  return count;
+}
+
+bool sm_shellcore_title_is_protected(const char *title_id) {
+  if (!title_id || !title_id[0])
+    return false;
+  char titles[3][MAX_TITLE_ID];
+  size_t count = snapshot_protected_titles(titles);
+  for (size_t i = 0; i < count; ++i)
+    if (strcmp(title_id, titles[i]) == 0)
+      return true;
+  return false;
+}
+
+static bool protected_paths_overlap(const char *a, const char *b) {
+  if (path_matches_root_or_child(a, b) || path_matches_root_or_child(b, a))
+    return true;
+  char resolved_a[PATH_MAX], resolved_b[PATH_MAX];
+  return realpath(a, resolved_a) && realpath(b, resolved_b) &&
+         (path_matches_root_or_child(resolved_a, resolved_b) ||
+          path_matches_root_or_child(resolved_b, resolved_a));
+}
+
+bool sm_shellcore_source_is_protected(const char *path) {
+  if (!path || !path[0])
+    return false;
+  char titles[3][MAX_TITLE_ID];
+  size_t count = snapshot_protected_titles(titles);
+  for (size_t i = 0; i < count; ++i) {
+    char runtime_path[MAX_PATH];
+    if (!read_mount_link(titles[i], runtime_path, sizeof(runtime_path))) {
+      if (sm_shellcore_service_title_is_prepared(titles[i]))
+        return true;
+      continue; // Stock PKGs have no managed source; title protection applies.
+    }
+    if (protected_paths_overlap(path, runtime_path))
+      return true;
+    char chain[MAX_IMAGE_CHAIN_DEPTH][MAX_PATH];
+    size_t layers = 0;
+    if (!read_mount_image_chain(titles[i], chain, &layers) || layers == 0) {
+      if (is_under_image_mount_base(runtime_path))
+        return true;
+      continue;
+    }
+    for (size_t layer = 0; layer < layers; ++layer)
+      if (protected_paths_overlap(path, chain[layer]))
+        return true;
+  }
+  return false;
+}
+
 bool sm_shellcore_try_begin_external_mutation(void) {
   pthread_mutex_lock(&g_service.mutex);
   bool available = !g_service.external_mutation_in_progress &&
-                   !g_service.prepare_in_progress &&
+                   !launch_preparation_pending_locked() &&
                    g_service.releasing_title_id[0] == '\0';
   if (available)
     g_service.external_mutation_in_progress = true;
@@ -899,6 +1027,7 @@ static int handle_launch_failed_request(const char *title_id) {
   sm_pkg_backport_on_launch_failed(title_id);
 
   pthread_mutex_lock(&g_service.mutex);
+  bool was_busy = launch_preparation_pending_locked();
   if (strcmp(g_service.pending_launch_title_id, title_id) == 0) {
     g_service.pending_launch_title_id[0] = '\0';
     g_service.pending_sandbox_ready_handled = false;
@@ -908,7 +1037,10 @@ static int handle_launch_failed_request(const char *title_id) {
   if (bound_pid > 0)
     g_service.launch_pending = false;
   bool switch_pending = prepared && g_service.outgoing.title_id[0] != '\0';
+  bool changed = was_busy != launch_preparation_pending_locked();
   pthread_mutex_unlock(&g_service.mutex);
+  if (changed)
+    sm_scanner_wake();
   if (!prepared)
     return 0;
   if (bound_pid > 0) {

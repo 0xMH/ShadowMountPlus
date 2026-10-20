@@ -118,6 +118,15 @@ A successful version response has this shape:
 ```
 
 List responses contain `count` and the complete `images` or `games` array.
+Confirmed running `FAKE*` and `LAPY*` applications do not defer scans or block
+source copy/move/delete operations and uninstalls for unrelated titles. This
+applies to folder, image and installed-PKG applications. Ordinary PS4/PS5 games
+allow the same work while AppFocus confirms they are in the background. The
+live application's own title, source, and backing image chain remain protected;
+operations affecting them return `game_active`. Returning to an ordinary game,
+unknown focus, and pending launches/exits defer new background work. Focus
+changes wake the scanner; unblocking makes the next full resync due immediately.
+
 Image items expose `path`, `mount_point`, `size`, modification time, `unit_id`,
 `backend`, `complete`, `source_available`, `mapped` and `mounted`. Game items
 combine ShadowMount's game cache with `tbl_contentinfo` from app.db. They expose

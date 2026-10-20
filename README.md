@@ -35,6 +35,15 @@
 | `.ffpfsc` | `pfs` container | `LVD` | Experimental container for nested images |
 
 Notes:
+- Confirmed running `FAKE*` and `LAPY*` applications allow background scans,
+  registration, and source copy/move/delete operations on other titles, whether
+  the application uses a folder, image, or installed PKG. Its own runtime, source
+  and all backing image layers remain protected. Operations that would release
+  a shared image are refused. Ordinary games allow the same work after a
+  confirmed loss of AppFocus (for example, returning to the home menu), while
+  retaining protection for their own runtime and sources. Returning focus to an
+  ordinary game pauses scanning again. Unknown focus and pending launch/exit
+  transitions still defer background work.
 - Backend, read-only mode, and sector size can be configured via `/data/shadowmount/config.ini`.
 - Debug logging is enabled by default (`debug=1`) and writes to console plus `/data/shadowmount/debug.log` (set `debug=0` to disable).
 - **UFS (`.ffpkg`) is the recommended image format for normal use.**
