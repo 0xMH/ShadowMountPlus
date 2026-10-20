@@ -8,6 +8,7 @@
 #define SM_API_MAX_JSON_BODY_SIZE 4096u
 
 #define SM_API_ROUTE_INDEX "/"
+#define SM_API_ROUTE_FAVICON "/favicon.png"
 #define SM_API_ROUTE_VERSION "/api/v1/version"
 #define SM_API_ROUTE_STORAGE "/api/v1/storage"
 #define SM_API_ROUTE_IMAGES "/api/v1/images"

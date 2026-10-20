@@ -52,6 +52,8 @@
 
 extern unsigned char web_index_html[];
 extern unsigned int web_index_html_len;
+extern unsigned char smp_icon_png[];
+extern unsigned int smp_icon_png_len;
 
 typedef struct {
   pthread_t thread;
@@ -343,16 +345,19 @@ static bool send_file_response(struct MHD_Connection *connection, int fd,
   return result == MHD_YES;
 }
 
-static bool send_embedded_index_response(struct MHD_Connection *connection) {
+static bool send_embedded_response(struct MHD_Connection *connection,
+                                    const void *data, size_t data_size,
+                                    const char *content_type,
+                                    const char *cache_control) {
   struct MHD_Response *response = MHD_create_response_from_buffer(
-      (size_t)web_index_html_len, web_index_html, MHD_RESPMEM_PERSISTENT);
+      data_size, (void *)data, MHD_RESPMEM_PERSISTENT);
   if (!response)
     return false;
   bool ready = add_common_response_headers(response) &&
                MHD_add_response_header(response, MHD_HTTP_HEADER_CONTENT_TYPE,
-                                       "text/html; charset=utf-8") == MHD_YES &&
+                                       content_type) == MHD_YES &&
                MHD_add_response_header(response, MHD_HTTP_HEADER_CACHE_CONTROL,
-                                       "no-cache") == MHD_YES;
+                                       cache_control) == MHD_YES;
   enum MHD_Result result =
       ready ? MHD_queue_response(connection, MHD_HTTP_OK, response) : MHD_NO;
   MHD_destroy_response(response);
@@ -1494,7 +1499,9 @@ static bool handle_index_page(struct MHD_Connection *connection) {
   if (fd < 0) {
     int status = errno != 0 ? errno : EIO;
     if (status == ENOENT || status == ENOTDIR)
-      return send_embedded_index_response(connection);
+      return send_embedded_response(connection, web_index_html,
+                                     (size_t)web_index_html_len,
+                                     "text/html; charset=utf-8", "no-cache");
     return send_error_response(connection, operation_http_status(status),
                                status, strerror(status));
   }
@@ -3436,6 +3443,10 @@ static enum MHD_Result handle_http_request(
     bool queued = false;
     if (strcmp(url, SM_API_ROUTE_INDEX) == 0)
       queued = handle_index_page(connection);
+    else if (strcmp(url, SM_API_ROUTE_FAVICON) == 0)
+      queued = send_embedded_response(connection, smp_icon_png,
+                                       (size_t)smp_icon_png_len,
+                                       "image/png", "public, max-age=86400");
     else if (strcmp(url, SM_API_ROUTE_GAME_ICON) == 0)
       queued = handle_game_icon(connection);
     else
