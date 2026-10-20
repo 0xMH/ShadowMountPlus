@@ -68,10 +68,11 @@ static void note_found_indexed_title(const char *title_id, const void *ctx) {
   char linked_image[MAX_PATH];
   if (!image_path ||
       !read_mount_link(title_id, runtime_path, sizeof(runtime_path)) ||
-      !read_mount_image_link(title_id, linked_image, sizeof(linked_image)) ||
-      strcmp(linked_image, image_path) != 0) {
+      !read_mount_image_link(title_id, linked_image, sizeof(linked_image))) {
     return;
   }
+  if (strcmp(linked_image, image_path) != 0)
+    notify_duplicate_title_once(title_id, image_path, linked_image);
   cache_game_entry(runtime_path, title_id, "");
 }
 
@@ -338,11 +339,20 @@ static existing_directory_result_t handle_existing_directory_candidate(
   }
 
   if (installed && appmeta_present && has_tracked_path &&
-      strcmp(tracked_path, full_path) != 0 &&
-      is_data_mounted(info->title_id)) {
-    (void)strlcpy(preferred_existing_path_out, tracked_path, MAX_PATH);
-    cache_game_entry(tracked_path, info->title_id, info->title_name);
-    return EXISTING_DIRECTORY_PREFER_CACHED;
+      strcmp(tracked_path, full_path) != 0) {
+    char linked_image[MAX_PATH];
+    // Runtime layers are normally released between scans. Keep the selected
+    // image while its fingerprint still proves that it contains this title.
+    bool linked_source_valid =
+        is_under_image_mount_base(tracked_path) &&
+        read_mount_image_link(info->title_id, linked_image,
+                               sizeof(linked_image)) &&
+        sm_image_index_source_has_title(linked_image, info->title_id);
+    if (linked_source_valid || is_data_mounted(info->title_id)) {
+      (void)strlcpy(preferred_existing_path_out, tracked_path, MAX_PATH);
+      cache_game_entry(tracked_path, info->title_id, info->title_name);
+      return EXISTING_DIRECTORY_PREFER_CACHED;
+    }
   }
 
   if (!in_app_db && is_title_install_pending(info->title_id))
