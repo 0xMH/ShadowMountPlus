@@ -175,14 +175,16 @@ Scan path behavior:
 Backport overlay behavior:
 - For each `scanpath`, use:
   - `<scanpath>/backports/<TITLE_ID>/`
+  - `<scanpath>/backports/<TITLE_ID><suffix>/` (for example, `PPSA12345 Game Name`)
 - The `backports` folder is ignored during normal game scanning.
 - A backport is applied automatically to the matching mounted game from any configured scan path.
 - `/data/homebrew/backports/<TITLE_ID>/` remains available as a fallback even with custom scan paths; this does not add `/data/homebrew` to normal game scanning.
 - For an installed PKG, a matching external `backports/<TITLE_ID>` directory is added to the ready package `app0` through NSFS immediately before process spawn. Files use plain redirects and missing directory subtrees use directory overlays. Up to 256 redirect entries are supported per package sandbox. Redirect state follows the NSFS mount identity, so redirects are rebuilt when ShellCore recreates a sandbox under the same path. Missing backports and non-NSFS sandboxes are harmless skips. The package's own or external-backport `fakelib2`/`fakelib` remains available for the later `common/lib` pre-spawn overlay.
 - If multiple scan paths provide the same title backport, the game's own scan path wins; otherwise scan path order is used, followed by the internal fallback.
+- Within each scan path, the exact `<TITLE_ID>` directory wins. Otherwise, the first directory name beginning with the full title ID in byte order is selected. Files and nested directories are not candidates.
 - ShadowMount+ checks the selected backport for `fakelib2` and then `fakelib`; if neither exists, it checks the original game source in the same order. The selected directory is mounted into the running game's sandbox `common/lib`. A selected `fakelib2` remains exclusive: neither emulator updates nor the global fakelib can replace or supplement it. Per-game filtering and removal of `libkernel.sprx` still apply, using a cache when needed.
 - For folder/image games, `update_emulators=1` makes matching files from `emulators_path` replace files in the selected game fakelib, except when `fakelib2` is selected. Installed PKGs never compose `emulators_path` into their fakelib. The cache is refreshed when its sources change and expires after seven days without a game launch.
-- Before preparing and mounting fakelib for an installed PPR PKG, ShadowMount+ deletes `libSceAmpr.sprx` and `libScePlayGo.sprx` from the selected `/data/homebrew/backports/<TITLE_ID>/fakelib`. Missing files are harmless skips; a deletion failure stops the fakelib mount.
+- Before preparing and mounting fakelib for an installed PPR PKG, ShadowMount+ deletes `libSceAmpr.sprx` and `libScePlayGo.sprx` from the selected `/data/homebrew/backports/<TITLE_ID><suffix>/fakelib` (the suffix may be empty). Missing files are harmless skips; a deletion failure stops the fakelib mount.
 - With `auto_update_ampr=1`, ShadowMount+ checks for AMPR updates 30 seconds after startup and every four hours. It downloads a missing or newer emulator and displays a notification after a successful update.
 - When the mounted fakelib contains only the supported emulator libraries, the notification says `Emulators applied`. Otherwise the backport notification adds `Emulators updated` when emulator files were replaced.
 - If both global and per-game fakelib exist, they are combined in the game cache according to `global_fakelib_priority`, unless the selected backport contains `fakelib2`. Without a per-game fakelib, the global folder is used on its own, with a filtered cache when required.

@@ -1626,11 +1626,13 @@ static bool cleanup_fakelib_mount(void) {
 static bool cleanup_ppr_backport_fakelib(const char *title_id,
                                        const char *sandbox_app0_path) {
   char backport_path[MAX_PATH];
-  char expected_path[MAX_PATH];
-  (void)snprintf(expected_path, sizeof(expected_path),
-                 DEFAULT_BACKPORT_SCAN_PATH "/backports/%s", title_id);
+  static const char internal_backport_root[] =
+      DEFAULT_BACKPORT_SCAN_PATH "/" DEFAULT_BACKPORTS_DIR_NAME "/";
   if (!resolve_backport_path_for_title(title_id, NULL, backport_path) ||
-      strcmp(backport_path, expected_path) != 0) {
+      strncmp(backport_path, internal_backport_root,
+              sizeof(internal_backport_root) - 1u) != 0 ||
+      !backport_name_matches_title(
+          title_id, backport_path + sizeof(internal_backport_root) - 1u)) {
     return true;
   }
 

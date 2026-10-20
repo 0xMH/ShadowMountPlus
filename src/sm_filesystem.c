@@ -509,7 +509,7 @@ static bool path_is_managed_backport_for_title(const char *title_id,
       continue;
     if (path[root_len] != '/')
       continue;
-    if (strcmp(path + root_len + 1u, title_id) == 0)
+    if (backport_name_matches_title(title_id, path + root_len + 1u))
       return true;
   }
 

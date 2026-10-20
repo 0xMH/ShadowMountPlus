@@ -744,9 +744,16 @@ static bool collect_manual_path_visit(const char *manual_path, void *ctx_ptr) {
   return true;
 }
 
-static bool build_backport_path_for_scan_root(const char *title_id,
+static bool backport_path_is_dir(const char *backport_path) {
+  struct stat st;
+  return backport_path && stat(backport_path, &st) == 0 &&
+         S_ISDIR(st.st_mode);
+}
+
+static bool resolve_backport_path_for_scan_root(const char *title_id,
                                               const char *scan_path,
                                               char backport_path[MAX_PATH]) {
+  backport_path[0] = '\0';
   if (!title_id || title_id[0] == '\0' || !scan_path || scan_path[0] == '\0')
     return false;
 
@@ -756,25 +763,64 @@ static bool build_backport_path_for_scan_root(const char *title_id,
 
   int written = snprintf(backport_path, MAX_PATH, "%s/%s", backport_root,
                          title_id);
-  return written > 0 && (size_t)written < MAX_PATH;
-}
+  if (written <= 0 || (size_t)written >= MAX_PATH) {
+    backport_path[0] = '\0';
+    return false;
+  }
+  if (backport_path_is_dir(backport_path))
+    return true;
 
-static bool backport_path_is_dir(const char *backport_path) {
-  struct stat st;
-  return backport_path && stat(backport_path, &st) == 0 &&
-         S_ISDIR(st.st_mode);
+  backport_path[0] = '\0';
+  DIR *directory = opendir(backport_root);
+  if (!directory)
+    return false;
+
+  size_t name_offset = strlen(backport_root) + 1u;
+  int read_error;
+  for (;;) {
+    errno = 0;
+    struct dirent *entry = readdir(directory);
+    if (!entry) {
+      read_error = errno;
+      break;
+    }
+    if (!backport_name_matches_title(title_id, entry->d_name))
+      continue;
+    if (entry->d_type != DT_DIR && entry->d_type != DT_UNKNOWN &&
+        entry->d_type != DT_LNK)
+      continue;
+    // Compare names before formatting or inspecting a less preferred path.
+    if (backport_path[0] != '\0' &&
+        strcmp(entry->d_name, backport_path + name_offset) >= 0)
+      continue;
+
+    char candidate_path[MAX_PATH];
+    written = snprintf(candidate_path, sizeof(candidate_path), "%s/%s",
+                        backport_root, entry->d_name);
+    if (written <= 0 || (size_t)written >= sizeof(candidate_path))
+      continue;
+    if (backport_path_is_dir(candidate_path))
+      (void)strlcpy(backport_path, candidate_path, MAX_PATH);
+  }
+  if (closedir(directory) != 0 && read_error == 0)
+    read_error = errno;
+  if (read_error != 0) {
+    backport_path[0] = '\0';
+    errno = read_error;
+    return false;
+  }
+  return backport_path[0] != '\0';
 }
 
 bool resolve_backport_path_for_title(const char *title_id,
                                      const char *owning_scan_path,
                                      char backport_path[MAX_PATH]) {
+  backport_path[0] = '\0';
   if (!title_id || title_id[0] == '\0')
     return false;
 
-  backport_path[0] = '\0';
-  if (build_backport_path_for_scan_root(title_id, owning_scan_path,
-                                        backport_path) &&
-      backport_path_is_dir(backport_path)) {
+  if (resolve_backport_path_for_scan_root(title_id, owning_scan_path,
+                                          backport_path)) {
     return true;
   }
 
@@ -785,14 +831,8 @@ bool resolve_backport_path_for_title(const char *title_id,
     if (owning_scan_path && strcmp(scan_path, owning_scan_path) == 0)
       continue;
 
-    char candidate_path[MAX_PATH];
-    if (!build_backport_path_for_scan_root(title_id, scan_path, candidate_path))
-      continue;
-    if (!backport_path_is_dir(candidate_path))
-      continue;
-
-    (void)strlcpy(backport_path, candidate_path, MAX_PATH);
-    return true;
+    if (resolve_backport_path_for_scan_root(title_id, scan_path, backport_path))
+      return true;
   }
 
   backport_path[0] = '\0';
