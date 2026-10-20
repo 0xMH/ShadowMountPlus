@@ -49,6 +49,8 @@ static const char *const g_en_us[SM_L10N_COUNT] = {
     [SM_L10N_AMPR_EMULATOR_UPDATED] = "AMPR emulator updated",
     [SM_L10N_SHELLCORE_HOOKS_FAILED] =
         "ShadowMount+: failed to install ShellCore hooks",
+    [SM_L10N_KSTUFF_WAITING] =
+        "ShadowMount+: kstuff not found; waiting for it to start.",
     [SM_L10N_TEMPERATURE_TRANSITION] =
         "Target temperature %u °C → %u °C",
     [SM_L10N_USB_CONNECTED_SCANNING] =

@@ -64,6 +64,8 @@ static const char *const g_el_gr[SM_L10N_COUNT] = {
     [SM_L10N_AMPR_EMULATOR_UPDATED] = "Ο εξομοιωτής AMPR ενημερώθηκε",
     /* English: ShadowMount+: failed to install ShellCore hooks */
     [SM_L10N_SHELLCORE_HOOKS_FAILED] = "ShadowMount+: απέτυχε η εγκατάσταση των hooks του ShellCore",
+    /* English: ShadowMount+: kstuff not found; waiting for it to start. */
+    [SM_L10N_KSTUFF_WAITING] = "ShadowMount+: το kstuff δεν βρέθηκε· αναμονή για την εκκίνησή του",
     /* English: Target temperature %u °C → %u °C */
     [SM_L10N_TEMPERATURE_TRANSITION] = "Θερμοκρασία-στόχος %u °C → %u °C",
     /* English: External drive %s connected\nFree %llu.%llu GB of %llu.%llu (Block size %llu KB)\nGames on drive: %d%s */

@@ -28,6 +28,7 @@
 #include "sm_time.h"
 #include "sm_install.h"
 #include "sm_appdb.h"
+#include "sm_kstuff.h"
 #include "sm_limits.h"
 #include "sm_mdbg.h"
 #include "sm_paths.h"
@@ -45,6 +46,7 @@
 #define BACKPORK_PROCESS_NAME_ALT "ps5-backpork.elf"
 #define RESTART_WAIT_POLL_US 200000u
 #define RESTART_WAIT_MAX_US 60000000u
+#define KSTUFF_READY_POLL_US 2000000u
 #define STOP_FILE_POLL_INTERVAL_US 3000000ull
 #define KINFO_PID_OFFSET 72
 #define KINFO_TDNAME_OFFSET 447
@@ -301,6 +303,24 @@ bool sleep_with_stop_check(unsigned int total_us) {
     slept += step;
   }
   return should_stop_requested();
+}
+
+static bool wait_for_kstuff_ready(void) {
+  bool waiting = false;
+  while (!should_stop_requested()) {
+    if (sm_kstuff_is_loaded()) {
+      if (waiting)
+        log_debug("[KSTUFF] ready; continuing startup");
+      return true;
+    }
+    if (!waiting) {
+      log_debug("[KSTUFF] not found; waiting before starting services");
+      notify_system_l10n(SM_L10N_KSTUFF_WAITING);
+      waiting = true;
+    }
+    (void)sceKernelUsleep(KSTUFF_READY_POLL_US);
+  }
+  return false;
 }
 
 static void get_firmware_version_string(char out[32]) {
@@ -596,6 +616,10 @@ int main(void) {
   load_runtime_config();
   const runtime_config_t startup_cfg = runtime_config();
   sm_notifications_init();
+  if (!wait_for_kstuff_ready()) {
+    log_debug("[SHUTDOWN] stop requested while waiting for kstuff");
+    goto shutdown;
+  }
   stop_conflicting_backpork();
   sm_mdbg_init();
   if (!sm_shellcore_service_start())
