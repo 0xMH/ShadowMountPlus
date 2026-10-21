@@ -148,8 +148,13 @@ static bool sandbox_mount_matches(const struct statfs *fs,
   const char *mounted_source = fs->f_mntfromname;
   if (strncmp(mounted_source, "<above>:", 8) == 0)
     mounted_source += 8;
+  // ShellCore exposes /user/data at the sandbox's /data. Borrow that nullfs
+  // just like an existing /data mount, without accepting unrelated sources.
+  bool source_matches = strcmp(mounted_source, source) == 0 ||
+      (!overlay && strcmp(source, "/data") == 0 &&
+       strcmp(mounted_source, "/user/data") == 0);
   return strcmp(fs->f_fstypename, overlay ? "unionfs" : "nullfs") == 0 &&
-         strcmp(mounted_source, source) == 0;
+         source_matches;
 }
 
 static int sandbox_mount_identity_present(const fakelib_layer_t *layer) {
@@ -459,7 +464,7 @@ static bool sync_sandbox_storage_root(const char *title_id,
 }
 
 static bool mount_sandbox_storage_roots(const char *title_id,
-                                        const char *app0_path) {
+                                        const char *app0_path, bool usb_only) {
   struct statfs *mounts = NULL;
   int mount_count = sm_mount_table_snapshot(&mounts);
   if (mount_count < 0) {
@@ -469,9 +474,10 @@ static bool mount_sandbox_storage_roots(const char *title_id,
   }
 
   int sync_errno = 0;
+  unsigned root_count = usb_only ? SANDBOX_USB_ROOT_COUNT
+      : SANDBOX_USB_ROOT_COUNT + SANDBOX_EXT_ROOT_COUNT + 1u;
   // Keep sandbox /mnt local and expose only mounted storage volumes.
-  for (unsigned slot = 0;
-       slot <= SANDBOX_USB_ROOT_COUNT + SANDBOX_EXT_ROOT_COUNT; ++slot) {
+  for (unsigned slot = 0; slot < root_count; ++slot) {
     char source_path[MAX_PATH];
     if (slot < SANDBOX_USB_ROOT_COUNT)
       (void)snprintf(source_path, sizeof(source_path), "/mnt/usb%u", slot);
@@ -2161,7 +2167,7 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
                                         label, true, 0)) ||
       !ensure_sandbox_parent(sandbox_app0_path, "/mnt") ||
       !mount_sandbox_directory(title_id, sandbox_app0_path, "/data", 0) ||
-      !mount_sandbox_storage_roots(title_id, sandbox_app0_path) ||
+      !mount_sandbox_storage_roots(title_id, sandbox_app0_path, false) ||
       !mount_sandbox_fonts(title_id, sandbox_app0_path)) {
     int mount_errno = errno;
     if (!cleanup_fakelib_mount())
@@ -2207,15 +2213,75 @@ bool sm_fakelib_game_on_sandbox_ready(const char *title_id) {
   return ready;
 }
 
+static bool is_sandbox_usb_root(const char *path) {
+  return path && strncmp(path, "/mnt/usb", 8u) == 0 &&
+         path[8] >= '0' && path[8] < '0' + (int)SANDBOX_USB_ROOT_COUNT &&
+         path[9] == '\0';
+}
+
+bool sm_fakelib_game_set_usb_suspended(bool suspended) {
+  int sync_errno = 0;
+  pthread_mutex_lock(&g_fakelib_mutex);
+  // Sleep may have ended while the lifecycle watcher waited for game exit.
+  // Reject a stale phase before touching any aliases.
+  if (runtime_sleep_mode_active() != suspended || should_stop_requested()) {
+    pthread_mutex_unlock(&g_fakelib_mutex);
+    errno = EBUSY;
+    return false;
+  }
+
+  if (suspended) {
+    // USB aliases are siblings. Unmount and compact in one pass, preserving
+    // the order and ownership of all other layers and any failed aliases.
+    size_t retained = 0;
+    for (size_t i = 0; i < g_fakelib_mount.layer_count; ++i) {
+      fakelib_layer_t *layer = &g_fakelib_mount.layers[i];
+      bool usb_alias = layer->owned_mount && layer->label &&
+          strcmp(layer->label, "directory") == 0 &&
+          is_sandbox_usb_root(layer->source_path);
+      if (usb_alias && unmount_sandbox_layer(layer))
+        continue;
+      if (usb_alias) {
+        // Do not mask a real failure with an earlier transient busy error.
+        if (sync_errno == 0 || sync_errno == EBUSY)
+          sync_errno = errno != 0 ? errno : EIO;
+      }
+      if (retained != i)
+        g_fakelib_mount.layers[retained] = *layer;
+      ++retained;
+    }
+    memset(&g_fakelib_mount.layers[retained], 0,
+           (g_fakelib_mount.layer_count - retained) *
+               sizeof(g_fakelib_mount.layers[0]));
+    g_fakelib_mount.layer_count = retained;
+  } else if (g_fakelib_mount.mounts_ready &&
+             !mount_sandbox_storage_roots(g_fakelib_mount.title_id,
+                                          g_fakelib_mount.sandbox_app0_path,
+                                          true)) {
+    sync_errno = errno != 0 ? errno : EIO;
+  }
+  // Exit or rollback can leave a busy core layer after removing every USB
+  // alias. Its retained dependencies must still block USB source cleanup.
+  if (sync_errno == 0 && fakelib_session_active() &&
+      !g_fakelib_mount.mounts_ready)
+    sync_errno = EBUSY;
+  if (sync_errno != 0)
+    log_debug("  [FAKELIB] USB sandbox %s incomplete for %s: %s",
+              suspended ? "suspend" : "resume", g_fakelib_mount.title_id,
+              strerror(sync_errno));
+  pthread_mutex_unlock(&g_fakelib_mutex);
+  if (sync_errno != 0)
+    errno = sync_errno;
+  return sync_errno == 0;
+}
+
 void sm_fakelib_game_on_usb_mount_change(const char *source_path, bool mounted) {
-  if (!source_path || strncmp(source_path, "/mnt/usb", 8u) != 0 ||
-      source_path[8] < '0' ||
-      source_path[8] >= '0' + (int)SANDBOX_USB_ROOT_COUNT ||
-      source_path[9] != '\0')
+  if (!is_sandbox_usb_root(source_path))
     return;
 
   pthread_mutex_lock(&g_fakelib_mutex);
-  if (!g_fakelib_mount.mounts_ready) {
+  if (!g_fakelib_mount.mounts_ready || runtime_sleep_mode_active() ||
+      should_stop_requested()) {
     pthread_mutex_unlock(&g_fakelib_mutex);
     return;
   }
@@ -2231,9 +2297,10 @@ void sm_fakelib_game_on_usb_mount_change(const char *source_path, bool mounted) 
 
 void sm_fakelib_game_refresh_storage(void) {
   pthread_mutex_lock(&g_fakelib_mutex);
-  if (g_fakelib_mount.mounts_ready &&
+  if (g_fakelib_mount.mounts_ready && !runtime_sleep_mode_active() &&
+      !should_stop_requested() &&
       !mount_sandbox_storage_roots(g_fakelib_mount.title_id,
-                                    g_fakelib_mount.sandbox_app0_path)) {
+                                    g_fakelib_mount.sandbox_app0_path, false)) {
     log_debug("  [FAKELIB] sandbox storage refresh failed for %s: %s",
               g_fakelib_mount.title_id, strerror(errno));
   }

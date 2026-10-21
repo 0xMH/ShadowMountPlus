@@ -1157,7 +1157,6 @@ static void *game_lifecycle_watcher_main(void *arg) {
                                              plaintext_ppr_path);
         clear_all_pending_game_launches();
         sm_mdbg_game_shutdown();
-        sm_fakelib_game_shutdown();
         bool sleep_cleanup_complete = true;
         if (plaintext_ppr_pkg_game) {
           log_debug("  [SLEEP] plaintext-PPR package detected: %s",
@@ -1178,6 +1177,10 @@ static void *game_lifecycle_watcher_main(void *arg) {
           sleep_cleanup_complete = wait_for_shellcore_exit_cleanup_for_sleep(
               kq, usb_game);
         }
+        // The wait can process another game exit. Check the retained session
+        // afterwards and release only USB aliases before USB source cleanup.
+        if (!sm_fakelib_game_set_usb_suspended(true))
+          sleep_cleanup_complete = false;
         if (sleep_cleanup_complete) {
           runtime_mount_state_lock();
           unmount_usb_sources_for_suspend();
@@ -1216,6 +1219,7 @@ static void *game_lifecycle_watcher_main(void *arg) {
           is_process_alive(suspended_game_pid)) {
         handle_game_exec(kq, suspended_game_pid);
       }
+      (void)sm_fakelib_game_set_usb_suspended(false);
       suspended_game_pid = 0;
     }
 
