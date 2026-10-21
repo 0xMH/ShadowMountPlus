@@ -114,6 +114,12 @@ bool sm_fakelib_game_feature_enabled(void) {
   return runtime_config().backport_fakelib_enabled;
 }
 
+static bool is_sandbox_usb_root(const char *path) {
+  return path && strncmp(path, "/mnt/usb", 8u) == 0 &&
+         path[8] >= '0' && path[8] < '0' + (int)SANDBOX_USB_ROOT_COUNT &&
+         path[9] == '\0';
+}
+
 static bool mount_sandbox_layer(const char *title_id,
                                 const char *source_path,
                                 const char *mount_path,
@@ -145,16 +151,16 @@ static bool mount_sandbox_layer(const char *title_id,
 
 static bool sandbox_mount_matches(const struct statfs *fs,
                                    const char *source, bool overlay) {
+  if (strcmp(fs->f_fstypename, overlay ? "unionfs" : "nullfs") != 0)
+    return false;
   const char *mounted_source = fs->f_mntfromname;
   if (strncmp(mounted_source, "<above>:", 8) == 0)
     mounted_source += 8;
   // ShellCore exposes /user/data at the sandbox's /data. Borrow that nullfs
   // just like an existing /data mount, without accepting unrelated sources.
-  bool source_matches = strcmp(mounted_source, source) == 0 ||
+  return strcmp(mounted_source, source) == 0 ||
       (!overlay && strcmp(source, "/data") == 0 &&
        strcmp(mounted_source, "/user/data") == 0);
-  return strcmp(fs->f_fstypename, overlay ? "unionfs" : "nullfs") == 0 &&
-         source_matches;
 }
 
 static int sandbox_mount_identity_present(const fakelib_layer_t *layer) {
@@ -179,6 +185,57 @@ static int sandbox_mount_identity_present(const fakelib_layer_t *layer) {
   return found;
 }
 
+// A removed USB filesystem can make nullfs statfs fail with EPIPE/EAGAIN.
+// Resolve only the recorded mount, without traversing its reclaimed lower vnode.
+static bool unmount_unreachable_usb_layer(fakelib_layer_t *layer) {
+  struct statfs *mounts = NULL;
+  int count = sm_mount_table_snapshot(&mounts);
+  if (count < 0)
+    return false;
+
+  unsigned identity_mounts = 0;
+  bool matches = false;
+  unsigned path_mounts = 0;
+  for (int i = 0; i < count; ++i) {
+    bool same_path = strcmp(mounts[i].f_mntonname, layer->mount_path) == 0;
+    if (same_path)
+      ++path_mounts;
+    if (memcmp(&mounts[i].f_fsid, &layer->mount_fsid,
+               sizeof(layer->mount_fsid)) == 0) {
+      ++identity_mounts;
+      matches = same_path &&
+          sandbox_mount_matches(&mounts[i], layer->source_path, false);
+    }
+  }
+  free(mounts);
+  if (identity_mounts == 0) {
+    // The old identity is gone; a replacement path belongs to its new owner.
+    layer->created_mount_path = false;
+    return true;
+  }
+  if (!matches || identity_mounts != 1u || path_mounts != 1u) {
+    errno = EBUSY;
+    return false;
+  }
+
+  int32_t ids[2];
+  _Static_assert(sizeof(ids) == sizeof(layer->mount_fsid), "fsid layout");
+  memcpy(ids, &layer->mount_fsid, sizeof(ids));
+  char fsid_path[32];
+  (void)snprintf(fsid_path, sizeof(fsid_path), "FSID:%d:%d",
+                 (int)ids[0], (int)ids[1]);
+  // No force and no path fallback: a vanished ID cannot select a newer mount.
+  if (unmount(fsid_path, MNT_BYFSID) != 0) {
+    if (errno != ENOENT)
+      return false;
+    layer->created_mount_path = false;
+    return true;
+  }
+  log_debug("  [FAKELIB] USB directory unmounted by fsid: %s -> %s",
+            layer->source_path, layer->mount_path);
+  return true;
+}
+
 static bool unmount_sandbox_layer(fakelib_layer_t *layer) {
   const char *mount_path = layer->mount_path;
   if (layer->source_path[0] && !layer->owned_mount)
@@ -187,13 +244,23 @@ static bool unmount_sandbox_layer(fakelib_layer_t *layer) {
   if (layer->source_path[0]) {
     struct statfs fs;
     if (statfs(mount_path, &fs) != 0) {
-      if (errno != ENOENT)
-        return false;
-      int present = sandbox_mount_identity_present(layer);
-      if (present != 0) {
-        if (present > 0)
-          errno = EBUSY;
-        return false;
+      int lookup_errno = errno;
+      if ((lookup_errno == EPIPE || lookup_errno == EAGAIN) &&
+          layer->mount_identity_valid && layer->label &&
+          strcmp(layer->label, "directory") == 0 &&
+          is_sandbox_usb_root(layer->source_path)) {
+        if (!unmount_unreachable_usb_layer(layer))
+          return false;
+      } else {
+        if (lookup_errno != ENOENT && lookup_errno != ENOTDIR)
+          return false;
+        int present = sandbox_mount_identity_present(layer);
+        if (present != 0) {
+          if (present > 0)
+            errno = EBUSY;
+          return false;
+        }
+        layer->created_mount_path = false;
       }
     } else if (strcmp(fs.f_mntonname, mount_path) != 0 ||
                (layer->mount_identity_valid &&
@@ -2211,12 +2278,6 @@ bool sm_fakelib_game_on_sandbox_ready(const char *title_id) {
   bool ready = mount_fakelib_for_game_locked(0, title_id, false);
   pthread_mutex_unlock(&g_fakelib_mutex);
   return ready;
-}
-
-static bool is_sandbox_usb_root(const char *path) {
-  return path && strncmp(path, "/mnt/usb", 8u) == 0 &&
-         path[8] >= '0' && path[8] < '0' + (int)SANDBOX_USB_ROOT_COUNT &&
-         path[9] == '\0';
 }
 
 bool sm_fakelib_game_set_usb_suspended(bool suspended) {
