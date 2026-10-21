@@ -55,20 +55,18 @@
       margin-bottom: 18px;
     }
 
-    .brand { display: flex; align-items: center; gap: 13px; }
+    .brand { display: flex; align-items: center; }
 
     .brand-mark {
-      display: grid;
-      place-items: center;
+      display: block;
+      flex-shrink: 0;
       width: 42px;
       height: 42px;
-      border: 1px solid rgba(85, 167, 255, .45);
-      border-radius: 12px;
-      background: linear-gradient(145deg, #147ee8, #74baff);
-      box-shadow: 0 8px 24px rgba(20, 126, 232, .25);
-      font-size: 20px;
-      font-weight: 800;
+      margin-right: 13px;
+      object-fit: contain;
     }
+
+    [dir="rtl"] .brand-mark { margin-right: 0; margin-left: 13px; }
 
     h1, h2, h3, p { margin: 0; }
     h1 { font-size: 20px; letter-spacing: -.02em; }
@@ -212,14 +210,14 @@
     .cover {
       position: relative;
       width: 88px;
-      aspect-ratio: 1;
+      height: 88px;
       overflow: hidden;
       border: 1px solid var(--line);
       border-radius: 12px;
       background: linear-gradient(145deg, #1d2c43, #0c111a);
     }
 
-    .cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    .cover img { position: absolute; top: 0; right: 0; bottom: 0; left: 0; width: 100%; height: 100%; object-fit: cover; }
     .cover-fallback { display: grid; place-items: center; width: 100%; height: 100%; color: var(--blue); font-weight: 800; }
     .game-main { min-width: 0; }
     .game-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 10px; }
@@ -313,7 +311,10 @@
     .modal {
       position: fixed;
       z-index: 20;
-      inset: 0;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      left: 0;
       display: grid;
       place-items: center;
       padding: 20px;
@@ -327,7 +328,7 @@
     .modal-head { display: flex; align-items: start; justify-content: space-between; gap: 20px; padding: 18px; border-bottom: 1px solid var(--line); }
     .close { width: 36px; min-height: 36px; padding: 0; font-size: 22px; }
     .details { display: grid; grid-template-columns: 168px minmax(0, 1fr); align-items: start; gap: 18px; padding: 18px; }
-    .details .cover { width: 168px; }
+    .details .cover { width: 168px; height: 168px; }
     .detail-grid { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 7px 12px; margin-top: 13px; font-size: 13px; }
     .detail-key { color: var(--muted); }
     .detail-value { min-width: 0; overflow-wrap: anywhere; }
@@ -372,7 +373,7 @@
       .games { grid-template-columns: 1fr; }
       .sidebar { grid-template-columns: 1fr; }
       .details { grid-template-columns: 1fr; }
-      .details .cover { width: 120px; }
+      .details .cover { width: 120px; height: 120px; }
       .detail-grid { grid-template-columns: 105px minmax(0, 1fr); }
     }
   </style>
@@ -381,7 +382,7 @@
   <main class="shell">
     <header class="topbar">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true">S</div>
+        <img class="brand-mark" src="/favicon.png" width="42" height="42" alt="" aria-hidden="true">
         <div>
           <h1 data-i18n="pageTitle">Shadow Mount+ Library</h1>
           <p class="subtle" id="version" data-i18n="connecting">Connecting to API…</p>
@@ -1098,6 +1099,12 @@
         return item;
       }
 
+      function replaceContent(parent, child) {
+        // Older WebKit can leave children intact on replaceChildren() with no arguments.
+        parent.textContent = "";
+        if (child) parent.appendChild(child);
+      }
+
       function formatBytes(value) {
         if (!Number.isFinite(value) || value < 0) return "—";
         const units = byteUnits[currentLanguage] || byteUnits[defaultLanguage];
@@ -1181,7 +1188,7 @@
         state.activity.unshift({ message, kind, time: new Date().toLocaleTimeString(currentLanguage, { hour: "2-digit", minute: "2-digit" }) });
         state.activity = state.activity.slice(0, 8);
         const list = $("activity");
-        list.replaceChildren();
+        replaceContent(list);
         state.activity.forEach((entry) => {
           list.append(node("div", `activity-item ${entry.kind}`, `${entry.time} · ${entry.message}`));
         });
@@ -1278,7 +1285,7 @@
       function renderGames() {
         const games = filteredGames();
         const list = $("games");
-        list.replaceChildren();
+        replaceContent(list);
         if (!games.length) {
           list.append(node("div", "empty", t(state.games.length ? "nothingFound" : "libraryEmpty")));
         } else {
@@ -1427,7 +1434,7 @@
             return true;
           });
           if (!$("destinationModal").hidden) renderDestinationPicker();
-          list.replaceChildren();
+          replaceContent(list);
           if (!mounts.length) {
             list.append(node("span", "subtle", t("storageNotFound")));
             return;
@@ -1467,7 +1474,7 @@
         } catch (error) {
           state.storageDestinations = [];
           if (!$("destinationModal").hidden) renderDestinationPicker();
-          list.replaceChildren(node("span", "subtle", errorMessage(error)));
+          replaceContent(list, node("span", "subtle", errorMessage(error)));
         }
       }
 
@@ -1488,7 +1495,7 @@
           renderGames();
         } catch (error) {
           setConnection("offline", "disconnected");
-          $("games").replaceChildren(node("div", "empty", t("apiError", { error: errorMessage(error) })));
+          replaceContent($("games"), node("div", "empty", t("apiError", { error: errorMessage(error) })));
           toast(errorMessage(error), true);
         } finally {
           state.busy = false;
@@ -1504,7 +1511,7 @@
         const list = $("manualList");
         try {
           const data = await api("/manual/list");
-          list.replaceChildren();
+          replaceContent(list);
           if (!data.paths.length) {
             list.append(node("span", "subtle", t("listEmpty")));
             return;
@@ -1520,13 +1527,13 @@
             list.append(row);
           });
         } catch (error) {
-          list.replaceChildren(node("span", "subtle", errorMessage(error)));
+          replaceContent(list, node("span", "subtle", errorMessage(error)));
         }
       }
 
       function renderScanPaths() {
         const list = $("scanPathList");
-        list.replaceChildren();
+        replaceContent(list);
         if (!state.scanPaths.length) {
           list.append(node("span", "subtle", t("listEmpty")));
           return;
@@ -1563,7 +1570,7 @@
           state.scanPaths = Array.isArray(settings.scan_paths) ? settings.scan_paths.slice() : [];
           renderScanPaths();
         } catch (error) {
-          $("scanPathList").replaceChildren(node("span", "subtle", errorMessage(error)));
+          replaceContent($("scanPathList"), node("span", "subtle", errorMessage(error)));
         }
       }
 
@@ -1771,7 +1778,7 @@
         $("modalTitle").textContent = game.title_name || game.title_id;
         $("modalSubtitle").textContent = `${game.title_id} · ${(game.platform || t("unknown")).toUpperCase()}`;
         const details = $("details");
-        details.replaceChildren();
+        replaceContent(details);
         details.append(coverFor(game, true));
         const content = node("div");
         const badges = node("div", "badges");
@@ -1819,7 +1826,7 @@
         details.append(content);
 
         const actions = $("modalActions");
-        actions.replaceChildren();
+        replaceContent(actions);
         const runtimeAction = appendRuntimeActions(actions, game);
         if (game.can_uninstall !== false) {
           actions.append(actionButton(t("uninstall"), () => uninstallGame(game), "danger"));
@@ -1855,14 +1862,14 @@
         $("modal").hidden = false;
         $("modalTitle").textContent = t("loading");
         $("modalSubtitle").textContent = titleId;
-        $("details").replaceChildren(node("div", "empty", t("loadingSource")));
-        $("modalActions").replaceChildren();
+        replaceContent($("details"), node("div", "empty", t("loadingSource")));
+        replaceContent($("modalActions"));
         try {
           const game = await api("/games/info", { title_id: titleId });
           if (state.detailRequest === request) renderDetails(game, true);
         } catch (error) {
           if (state.detailRequest === request) {
-            $("details").replaceChildren(node("div", "empty", errorMessage(error)));
+            replaceContent($("details"), node("div", "empty", errorMessage(error)));
           }
         }
       }
@@ -1885,7 +1892,7 @@
           ? "chooseCopyDestination"
           : "chooseMoveDestination");
         const choices = $("destinationChoices");
-        choices.replaceChildren();
+        replaceContent(choices);
         if (!state.storageDestinations.length) {
           choices.append(node("span", "subtle", t("storageNotFound")));
         }
