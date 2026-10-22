@@ -1,4 +1,6 @@
 #include "sm_platform.h"
+#include "sm_shellcore_service.h"
+#include "sm_game_lifecycle.h"
 #include "sm_config_mount.h"
 #include "sm_runtime.h"
 #include "sm_install.h"
@@ -398,15 +400,20 @@ void process_scan_candidates(const scan_candidate_t *candidates,
   sm_install_poll_pending();
 
   for (int i = 0; i < candidate_count; i++) {
-    if (should_stop_requested() || runtime_sleep_mode_active())
+    if (should_stop_requested() || runtime_sleep_mode_active() ||
+        !sm_game_lifecycle_background_title(NULL))
       return;
 
     const scan_candidate_t *c = &candidates[i];
+    if (sm_shellcore_title_is_protected(c->title_id))
+      continue;
+    
     if (c->kind == SCAN_CANDIDATE_PKG) {
       if (!sm_pkg_install_queue_candidate(c))
         log_debug("  [PKG] failed to queue package: %s", c->path);
       continue;
     }
+
     bool has_src_snd0 = false;
     bool use_app_install_all =
         runtime_config().app_install_all_enabled && !c->in_app_db;

@@ -40,6 +40,7 @@
 
 #define SM_API_RETRY_INITIAL_MS 250u
 #define SM_API_RETRY_MAX_MS 5000u
+#define SM_API_LISTENER_CHECK_MS 10000u
 #define SM_API_ROUTE_SIZE 128u
 #define SM_API_WORKER_COUNT 8u
 #define SM_API_CONNECTION_LIMIT 32u
@@ -52,6 +53,8 @@
 
 extern unsigned char web_index_html[];
 extern unsigned int web_index_html_len;
+extern unsigned char smp_icon_png[];
+extern unsigned int smp_icon_png_len;
 
 typedef struct {
   pthread_t thread;
@@ -59,6 +62,7 @@ typedef struct {
   pthread_cond_t cond;
   bool started;
   bool stop_requested;
+  bool restart_requested;
   struct MHD_Daemon *daemon;
   char bind_address[MAX_API_BIND_ADDRESS];
   uint16_t port;
@@ -191,11 +195,13 @@ static bool wait_until_runtime_awake(void) {
     }
   }
   bool keep_running = !g_api.stop_requested;
+  if (keep_running)
+    g_api.restart_requested = false;
   pthread_mutex_unlock(&g_api.mutex);
   return keep_running;
 }
 
-static bool wait_before_listener_retry(uint32_t delay_ms) {
+static bool wait_for_listener_event(uint32_t delay_ms) {
   struct timespec deadline;
   if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
     sceKernelUsleep(SM_API_RETRY_INITIAL_MS * 1000u);
@@ -214,21 +220,19 @@ static bool wait_before_listener_retry(uint32_t delay_ms) {
 
   pthread_mutex_lock(&g_api.mutex);
   int wait_status = 0;
-  while (!g_api.stop_requested && !runtime_sleep_mode_active()) {
+  while (!g_api.stop_requested && !g_api.restart_requested &&
+         !runtime_sleep_mode_active()) {
     wait_status =
         pthread_cond_timedwait(&g_api.cond, &g_api.mutex, &deadline);
     if (wait_status != 0)
       break;
   }
+  if (wait_status != 0 && wait_status != ETIMEDOUT) {
+    log_debug("  [API] listener wait failed: %s", strerror(wait_status));
+    g_api.stop_requested = true;
+  }
   bool keep_running = !g_api.stop_requested;
   pthread_mutex_unlock(&g_api.mutex);
-
-  if (keep_running && wait_status != 0 && wait_status != ETIMEDOUT) {
-    sceKernelUsleep(SM_API_RETRY_INITIAL_MS * 1000u);
-    pthread_mutex_lock(&g_api.mutex);
-    keep_running = !g_api.stop_requested;
-    pthread_mutex_unlock(&g_api.mutex);
-  }
   return keep_running;
 }
 
@@ -342,16 +346,19 @@ static bool send_file_response(struct MHD_Connection *connection, int fd,
   return result == MHD_YES;
 }
 
-static bool send_embedded_index_response(struct MHD_Connection *connection) {
+static bool send_embedded_response(struct MHD_Connection *connection,
+                                    const void *data, size_t data_size,
+                                    const char *content_type,
+                                    const char *cache_control) {
   struct MHD_Response *response = MHD_create_response_from_buffer(
-      (size_t)web_index_html_len, web_index_html, MHD_RESPMEM_PERSISTENT);
+      data_size, (void *)data, MHD_RESPMEM_PERSISTENT);
   if (!response)
     return false;
   bool ready = add_common_response_headers(response) &&
                MHD_add_response_header(response, MHD_HTTP_HEADER_CONTENT_TYPE,
-                                       "text/html; charset=utf-8") == MHD_YES &&
+                                       content_type) == MHD_YES &&
                MHD_add_response_header(response, MHD_HTTP_HEADER_CACHE_CONTROL,
-                                       "no-cache") == MHD_YES;
+                                       cache_control) == MHD_YES;
   enum MHD_Result result =
       ready ? MHD_queue_response(connection, MHD_HTTP_OK, response) : MHD_NO;
   MHD_destroy_response(response);
@@ -915,7 +922,8 @@ static const char *game_platform_name(const char *title_id,
 static bool api_listener_stop_requested(void *ctx) {
   (void)ctx;
   pthread_mutex_lock(&g_api.mutex);
-  bool stopping = g_api.stop_requested;
+  bool stopping = g_api.stop_requested || g_api.restart_requested ||
+                  runtime_sleep_mode_active();
   pthread_mutex_unlock(&g_api.mutex);
   return stopping;
 }
@@ -1129,6 +1137,8 @@ static struct json_object *game_to_json(
       !add_json_bool(item, "can_uninstall", installed) ||
       !add_json_bool(item, "can_manage_source", !installed_pkg) ||
       !add_json_bool(item, "can_toggle_fakelib", can_toggle_fakelib) ||
+      !add_json_bool(item, "ignore_global_fakelib",
+                     sm_config_title_global_fakelib_excluded(cfg, source->title_id)) ||
       !add_json_bool(item, "fakelib_enabled", fakelib_enabled) ||
       !add_json_string(item, "fakelib_mode",
                        sm_config_fakelib_mode_name(fakelib_mode)) ||
@@ -1490,7 +1500,9 @@ static bool handle_index_page(struct MHD_Connection *connection) {
   if (fd < 0) {
     int status = errno != 0 ? errno : EIO;
     if (status == ENOENT || status == ENOTDIR)
-      return send_embedded_index_response(connection);
+      return send_embedded_response(connection, web_index_html,
+                                     (size_t)web_index_html_len,
+                                     "text/html; charset=utf-8", "no-cache");
     return send_error_response(connection, operation_http_status(status),
                                status, strerror(status));
   }
@@ -1652,10 +1664,9 @@ static bool add_scan_queue_fields(struct json_object *response, bool queued) {
   if (queued) {
     if (runtime_sleep_mode_active())
       reason = "rest_mode";
-    else if (sm_game_lifecycle_has_active_game())
-      reason = "game_active";
-    else if (sm_shellcore_service_has_prepared_mount())
-      reason = "runtime_prepared";
+    else if (sm_shellcore_background_work_blocked())
+      reason = sm_game_lifecycle_has_active_game() ? "game_active"
+                                                  : "runtime_prepared";
   }
   return add_json_bool(response, "scan_queued", queued) &&
          add_json_bool(response, "scan_deferred", reason[0] != '\0') &&
@@ -2140,7 +2151,8 @@ static void handle_kernel_log(struct MHD_Connection *connection,
 static const char *runtime_mutation_block_reason(void) {
   if (runtime_sleep_mode_active())
     return "rest_mode";
-  if (sm_game_lifecycle_has_active_game())
+  if (sm_game_lifecycle_has_active_game() &&
+      sm_shellcore_background_work_blocked())
     return "game_active";
   if (sm_install_has_pending_work())
     return "install_pending";
@@ -2175,6 +2187,10 @@ static int request_game_uninstall(const char *title_id,
   *error_out = runtime_mutation_block_reason();
   if (*error_out)
     return EBUSY;
+  if (sm_shellcore_title_is_protected(title_id)) {
+    *error_out = "game_active";
+    return EBUSY;
+  }
   sm_game_cache_snapshot_entry_t package;
   bool installed_pkg = find_installed_pkg_game(title_id, &package);
   if (!installed_pkg && errno != ENOENT)
@@ -2183,12 +2199,21 @@ static int request_game_uninstall(const char *title_id,
     return ENOENT;
 
   bool title_prepared = sm_shellcore_service_title_is_prepared(title_id);
-  if (sm_shellcore_service_has_prepared_mount() && !title_prepared) {
+  if (sm_shellcore_service_has_prepared_mount() && !title_prepared &&
+      sm_shellcore_background_work_blocked()) {
     *error_out = "runtime_prepared";
     return EBUSY;
   }
   if (!installed_pkg && (title_prepared || is_data_mounted(title_id))) {
-    int release_status = sm_shellcore_unmount_title_runtime(title_id);
+    int release_status;
+    if (!title_prepared && sm_game_lifecycle_has_active_game()) {
+      runtime_mount_state_lock();
+      bool released = unmount_title_runtime_layers(title_id);
+      release_status = released ? 0 : (errno != 0 ? errno : EIO);
+      runtime_mount_state_unlock();
+    } else {
+      release_status = sm_shellcore_unmount_title_runtime(title_id);
+    }
     if (release_status != 0) {
       if (release_status == EBUSY)
         *error_out = "title_unmount_busy";
@@ -2269,21 +2294,31 @@ static void handle_uninstall(struct MHD_Connection *fd,
 static void handle_game_fakelib(struct MHD_Connection *connection,
                                  struct json_object *request) {
   const char *title_id = get_title_id(request);
-  sm_fakelib_mode_t mode;
+  sm_fakelib_mode_t mode = SM_FAKELIB_DEFAULT;
   struct json_object *mode_value = NULL;
-  bool valid_mode;
-  if (json_object_object_get_ex(request, "mode", &mode_value)) {
-    valid_mode = json_object_is_type(mode_value, json_type_string) &&
-                 sm_config_parse_fakelib_mode(
-                     json_object_get_string(mode_value), &mode);
+  struct json_object *global_value = NULL;
+  bool update_global = json_object_object_get_ex(request, "ignore_global_fakelib",
+                                                 &global_value);
+  bool global_excluded = false;
+  bool valid_policy;
+  if (update_global) {
+    valid_policy = json_object_is_type(global_value, json_type_boolean) &&
+                   !json_object_object_get_ex(request, "mode", &mode_value) &&
+                   !json_object_object_get_ex(request, "enabled", &mode_value);
+    global_excluded = json_object_get_boolean(global_value);
+  } else if (json_object_object_get_ex(request, "mode", &mode_value)) {
+    valid_policy = json_object_is_type(mode_value, json_type_string) &&
+                   sm_config_parse_fakelib_mode(
+                       json_object_get_string(mode_value), &mode);
   } else {
     bool enabled = false;
-    valid_mode = get_required_bool(request, "enabled", &enabled);
+    valid_policy = get_required_bool(request, "enabled", &enabled);
     mode = enabled ? SM_FAKELIB_FULL : SM_FAKELIB_DISABLED;
   }
-  if (!title_id || !valid_mode) {
+  if (!title_id || !valid_policy) {
     send_error_response(connection, 400, EINVAL,
-                        "title_id and mode (default, full, emulators, disabled) are required");
+                        "title_id and a valid fakelib setting are required; "
+                        "ignore_global_fakelib cannot be combined with mode or enabled");
     return;
   }
   if (strncmp(title_id, "PPSA", 4u) != 0) {
@@ -2313,7 +2348,10 @@ static void handle_game_fakelib(struct MHD_Connection *connection,
                         strerror(status));
     return;
   }
-  if (!sm_config_set_title_fakelib_mode(title_id, mode)) {
+  bool saved = update_global
+                   ? sm_config_set_title_global_fakelib_excluded(title_id, global_excluded)
+                   : sm_config_set_title_fakelib_mode(title_id, mode);
+  if (!saved) {
     int status = errno != 0 ? errno : EIO;
     send_error_response(connection, operation_http_status(status), status,
                         strerror(status));
@@ -2325,12 +2363,15 @@ static void handle_game_fakelib(struct MHD_Connection *connection,
   struct json_object *response = new_status_response(0);
   if (!response || !add_json_string(response, "title_id", title_id) ||
       !add_json_bool(response, "fakelib_enabled", enabled) ||
+      !add_json_bool(response, "ignore_global_fakelib",
+                     sm_config_title_global_fakelib_excluded(&cfg, title_id)) ||
       !add_json_string(response, "fakelib_mode",
                        sm_config_fakelib_mode_name(effective_mode)) ||
       !add_json_string(response, "fakelib_default_mode",
                        sm_config_fakelib_mode_name(cfg.fakelib_default_mode)) ||
       !add_json_string(response, "fakelib_mode_override",
-                       sm_config_fakelib_mode_name(mode)) ||
+                       sm_config_fakelib_mode_name(
+                           sm_config_title_fakelib_override(&cfg, title_id))) ||
       !add_json_bool(response, "fakelib_effective_enabled",
                      enabled && cfg.backport_fakelib_enabled) ||
       !add_json_bool(response, "saved", true) ||
@@ -2512,8 +2553,13 @@ static int release_storage_source_runtime(const char *physical_path,
   *error_out = runtime_mutation_block_reason();
   if (*error_out)
     return EBUSY;
-  if (sm_shellcore_service_has_prepared_mount()) {
+  if (sm_shellcore_background_work_blocked()) {
     *error_out = "runtime_prepared";
+    return EBUSY;
+  }
+  if (sm_shellcore_title_is_protected(title_id) ||
+      sm_shellcore_source_is_protected(physical_path)) {
+    *error_out = "game_active";
     return EBUSY;
   }
 
@@ -2933,6 +2979,14 @@ static void *storage_job_thread_main(void *arg) {
   if (status == 0 && storage_job_cancelled(job_ctx))
     status = ECANCELED;
 
+  if (status == 0 &&
+      (sm_shellcore_title_is_protected(title_id) ||
+       sm_shellcore_source_is_protected(source) ||
+       sm_shellcore_source_is_protected(destination))) {
+    status = EBUSY;
+    error = "game_active";
+  }
+
   if (status == 0) {
     pthread_mutex_lock(&g_storage_job.mutex);
     if (g_storage_job.id != job_id || g_storage_job.cancel_requested)
@@ -3104,6 +3158,12 @@ static int start_storage_job(const char *title_id,
                                        source_info.physical_path, destination);
     if (destination_status != 0)
       return destination_status;
+  }
+  if (sm_shellcore_title_is_protected(title_id) ||
+      sm_shellcore_source_is_protected(source_info.physical_path) ||
+      sm_shellcore_source_is_protected(destination)) {
+    *error_out = "game_active";
+    return EBUSY;
   }
 
   pthread_mutex_lock(&g_storage_job.mutex);
@@ -3391,6 +3451,10 @@ static enum MHD_Result handle_http_request(
     bool queued = false;
     if (strcmp(url, SM_API_ROUTE_INDEX) == 0)
       queued = handle_index_page(connection);
+    else if (strcmp(url, SM_API_ROUTE_FAVICON) == 0)
+      queued = send_embedded_response(connection, smp_icon_png,
+                                       (size_t)smp_icon_png_len,
+                                       "image/png", "public, max-age=86400");
     else if (strcmp(url, SM_API_ROUTE_GAME_ICON) == 0)
       queued = handle_game_icon(connection);
     else
@@ -3510,6 +3574,23 @@ static struct MHD_Daemon *start_http_daemon(const char *bind_address,
   return daemon;
 }
 
+static int http_listener_status(struct MHD_Daemon *daemon) {
+  const union MHD_DaemonInfo *info =
+      MHD_get_daemon_info(daemon, MHD_DAEMON_INFO_LISTEN_FD);
+  if (!info || info->listen_fd == MHD_INVALID_SOCKET)
+    return EBADF;
+
+  int accepting = 0;
+  socklen_t size = sizeof(accepting);
+  if (getsockopt(info->listen_fd, SOL_SOCKET, SO_ACCEPTCONN,
+                 &accepting, &size) != 0) {
+    // A periodic probe can defer an interrupted read until the next check.
+    // Do not keep the service thread in a retry loop during shutdown.
+    return errno == EINTR ? 0 : (errno != 0 ? errno : EIO);
+  }
+  return accepting ? 0 : ENOTCONN;
+}
+
 static void *service_thread_main(void *arg) {
   (void)arg;
   pthread_mutex_lock(&g_api.mutex);
@@ -3530,14 +3611,15 @@ static void *service_thread_main(void *arg) {
                   bind_address, (unsigned int)port, strerror(start_error));
         outage_logged = true;
       }
-      if (!wait_before_listener_retry(retry_delay_ms))
+      if (!wait_for_listener_event(retry_delay_ms))
         break;
       retry_delay_ms = next_retry_delay_ms(retry_delay_ms);
       continue;
     }
 
     pthread_mutex_lock(&g_api.mutex);
-    if (g_api.stop_requested || runtime_sleep_mode_active()) {
+    if (g_api.stop_requested || g_api.restart_requested ||
+        runtime_sleep_mode_active()) {
       bool stopping = g_api.stop_requested;
       pthread_mutex_unlock(&g_api.mutex);
       MHD_stop_daemon(daemon);
@@ -3560,23 +3642,37 @@ static void *service_thread_main(void *arg) {
     outage_logged = false;
     retry_delay_ms = SM_API_RETRY_INITIAL_MS;
 
-    pthread_mutex_lock(&g_api.mutex);
-    while (!g_api.stop_requested && !runtime_sleep_mode_active()) {
-      int rc = pthread_cond_wait(&g_api.cond, &g_api.mutex);
-      if (rc != 0) {
-        log_debug("  [API] service wait failed: %s", strerror(rc));
-        g_api.stop_requested = true;
+    int listener_error = 0;
+    while (wait_for_listener_event(SM_API_LISTENER_CHECK_MS)) {
+      if (api_listener_stop_requested(NULL))
         break;
-      }
+      listener_error = http_listener_status(daemon);
+      if (listener_error != 0)
+        break;
+    }
+    pthread_mutex_lock(&g_api.mutex);
+    // Resume/stop may have arrived while the socket was being checked. Its
+    // invalidation is then expected, rather than an independent API outage.
+    if (g_api.stop_requested || g_api.restart_requested ||
+        runtime_sleep_mode_active()) {
+      listener_error = 0;
     }
     if (g_api.daemon == daemon)
       g_api.daemon = NULL;
+    // Let long-running request handlers cancel before MHD_stop_daemon joins
+    // its workers. Background storage jobs have their own cancellation state.
+    g_api.restart_requested = true;
     bool stopping = g_api.stop_requested;
     pthread_mutex_unlock(&g_api.mutex);
 
     MHD_stop_daemon(daemon);
     if (stopping)
       break;
+    if (listener_error != 0) {
+      log_debug("  [API] HTTP listener lost at %s:%u: %s; recovery scheduled",
+                bind_address, (unsigned int)port, strerror(listener_error));
+      outage_logged = true;
+    }
   }
   return NULL;
 }
@@ -3602,6 +3698,7 @@ bool sm_api_service_start(void) {
   }
   g_api.daemon = NULL;
   g_api.stop_requested = false;
+  g_api.restart_requested = false;
   (void)strlcpy(g_api.bind_address, bind_address,
                 sizeof(g_api.bind_address));
   g_api.port = port;
@@ -3637,6 +3734,7 @@ static void stop_api_listener(void) {
   pthread_mutex_lock(&g_api.mutex);
   g_api.started = false;
   g_api.stop_requested = false;
+  g_api.restart_requested = false;
   g_api.daemon = NULL;
   pthread_mutex_unlock(&g_api.mutex);
 }
@@ -3663,7 +3761,10 @@ void sm_api_service_on_sleep_change(bool active) {
     return;
   }
 
-  (void)active;
+  // Preserve resume across a coalesced sleep/wake notification: the service
+  // may never have observed sleep=true, but its old socket still needs reset.
+  if (!active)
+    g_api.restart_requested = true;
   pthread_cond_broadcast(&g_api.cond);
   pthread_mutex_unlock(&g_api.mutex);
 }

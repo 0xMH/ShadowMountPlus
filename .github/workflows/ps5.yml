@@ -62,6 +62,16 @@ jobs:
             xxd \
             zip
 
+      - name: Configure pacman for locally built packages
+        run: |
+          sudo install -d -m 755 /var/lib/pacman/local /var/cache/pacman/pkg
+          sudo tee /etc/pacman.conf > /dev/null <<'EOF'
+          [options]
+          Architecture = auto
+          SigLevel = Required DatabaseOptional
+          LocalFileSigLevel = Optional
+          EOF
+
       - name: Build PS5 payload SDK
         working-directory: pacbrew-repo/sdk
         run: |

@@ -8,10 +8,10 @@ static const char *const g_en_us[SM_L10N_COUNT] = {
     [SM_L10N_SCAN_DEPTH_ENABLED] = "ShadowMount+: scan depth %u enabled.",
     [SM_L10N_BACKPORT_OVERLAY_FAILED] =
         "Backport overlay failed: %s\n%s\n0x%08X",
-    [SM_L10N_GAME_BACKPORTED] = "Backport applied to game: %s",
+    [SM_L10N_GAME_BACKPORTED] = "Backport applied: %s",
     [SM_L10N_GAME_EMULATORS_APPLIED] = "Emulators applied to game: %s",
     [SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED] =
-        "Backport applied to game: %s\nEmulators updated",
+        "Backport applied: %s\nEmulators updated",
     [SM_L10N_IMAGE_REJECTED_CLUSTER_AUTOTUNED] =
         "Image mount rejected:\n%s\nCluster size is too small (%llu < %u).\n"
         "Saved image_sector override: %u.\nTry mounting again.",
@@ -49,6 +49,8 @@ static const char *const g_en_us[SM_L10N_COUNT] = {
     [SM_L10N_AMPR_EMULATOR_UPDATED] = "AMPR emulator updated",
     [SM_L10N_SHELLCORE_HOOKS_FAILED] =
         "ShadowMount+: failed to install ShellCore hooks",
+    [SM_L10N_KSTUFF_WAITING] =
+        "ShadowMount+: kstuff not found; waiting for it to start.",
     [SM_L10N_TEMPERATURE_TRANSITION] =
         "Target temperature %u °C → %u °C",
     [SM_L10N_USB_CONNECTED_SCANNING] =

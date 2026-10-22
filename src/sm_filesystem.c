@@ -1,4 +1,5 @@
 #include "sm_platform.h"
+#include "sm_shellcore_service.h"
 #include "sm_runtime.h"
 #include "sm_filesystem.h"
 #include "sm_config_mount.h"
@@ -509,7 +510,7 @@ static bool path_is_managed_backport_for_title(const char *title_id,
       continue;
     if (path[root_len] != '/')
       continue;
-    if (strcmp(path + root_len + 1u, title_id) == 0)
+    if (backport_name_matches_title(title_id, path + root_len + 1u))
       return true;
   }
 
@@ -686,6 +687,10 @@ static bool unmount_title_runtime_layers_impl(const char *title_id,
                                               bool diagnose_busy) {
   if (!title_id || title_id[0] == '\0')
     return false;
+  if (sm_shellcore_title_is_protected(title_id)) {
+    errno = EBUSY;
+    return false;
+  }
 
   char path[MAX_PATH];
   int written = snprintf(path, sizeof(path), "/system_ex/app/%s", title_id);
@@ -708,6 +713,8 @@ bool unmount_title_runtime_layers_quiet(const char *title_id) {
 
 static bool unmount_managed_title_entry(
     const char *title_id, const title_link_paths_t *paths, void *ctx) {
+  if (sm_shellcore_title_is_protected(title_id))
+    return true;
   bool *all_released = (bool *)ctx;
   char source_path[MAX_PATH];
   if (!read_mount_link_file(paths->mount_link, source_path,
@@ -1419,6 +1426,8 @@ static bool cleanup_mount_links_entry(const char *title_id,
                                       const title_link_paths_t *paths,
                                       void *ctx_ptr) {
   cleanup_mount_links_ctx_t *ctx = (cleanup_mount_links_ctx_t *)ctx_ptr;
+  if (sm_shellcore_title_is_protected(title_id))
+    return true;
 
   struct stat lst;
   if (stat(paths->mount_link, &lst) != 0 || !S_ISREG(lst.st_mode))

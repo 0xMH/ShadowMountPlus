@@ -351,7 +351,7 @@ paths:
           $ref: "#/components/responses/Preflight"
     post:
       operationId: setGameFakelib
-      summary: Set the fakelib mode for a PS5 game on its next launch
+      summary: Set the fakelib mode or global overlay exclusion for a PS5 game on its next launch
       tags: [Games]
       requestBody:
         required: true
@@ -360,9 +360,17 @@ paths:
             schema:
               type: object
               required: [title_id]
-              anyOf:
-                - required: [mode]
-                - required: [enabled]
+              oneOf:
+                - anyOf:
+                    - required: [mode]
+                    - required: [enabled]
+                  not:
+                    required: [ignore_global_fakelib]
+                - required: [ignore_global_fakelib]
+                  not:
+                    anyOf:
+                      - required: [mode]
+                      - required: [enabled]
               properties:
                 title_id:
                   $ref: "#/components/schemas/TitleId"
@@ -374,6 +382,9 @@ paths:
                 enabled:
                   type: boolean
                   description: Legacy alternative selecting explicit full when true or disabled when false.
+                ignore_global_fakelib:
+                  type: boolean
+                  description: Update only the global overlay exclusion. False removes it. Cannot be combined with mode or enabled.
       responses:
         "200":
           description: Per-title policy saved; existing mounts are preserved
@@ -381,7 +392,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status, title_id, fakelib_mode, fakelib_mode_override, fakelib_default_mode, fakelib_enabled, fakelib_effective_enabled, saved, applies_on_next_launch]
+                required: [status, title_id, fakelib_mode, fakelib_mode_override, fakelib_default_mode, fakelib_enabled, fakelib_effective_enabled, ignore_global_fakelib, saved, applies_on_next_launch]
                 properties:
                   status:
                     type: integer
@@ -400,6 +411,8 @@ paths:
                   fakelib_enabled:
                     type: boolean
                   fakelib_effective_enabled:
+                    type: boolean
+                  ignore_global_fakelib:
                     type: boolean
                   saved:
                     type: boolean
@@ -1616,6 +1629,7 @@ components:
         - can_uninstall
         - can_manage_source
         - can_toggle_fakelib
+        - ignore_global_fakelib
         - fakelib_mode
         - fakelib_mode_override
         - fakelib_default_mode
@@ -1679,6 +1693,9 @@ components:
         can_toggle_fakelib:
           type: boolean
           description: True for PS5 games in PKGs, images and folders.
+        ignore_global_fakelib:
+          type: boolean
+          description: Whether this title excludes the global fakelib overlay; independent of its fakelib mode.
         fakelib_mode:
           type: string
           enum: [full, emulators, disabled]

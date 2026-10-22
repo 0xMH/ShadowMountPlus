@@ -1,4 +1,5 @@
 #include "sm_platform.h"
+#include "sm_shellcore_service.h"
 #include <pthread.h>
 
 #include "sm_game_cache.h"
@@ -191,6 +192,8 @@ static void prune_game_cache_entries(const char *root) {
   for (int k = 0; k < MAX_PENDING; k++) {
     if (!g_game_cache[k].valid)
       continue;
+    if (sm_shellcore_title_is_protected(g_game_cache[k].title_id))
+      continue;
     if (root) {
       const char *entry_root =
           ensure_game_cache_owning_scan_root(&g_game_cache[k])
@@ -258,6 +261,7 @@ static void reconcile_missing_game_cache(
   for (int k = 0; k < MAX_PENDING; ++k) {
     struct GameCache *entry = &g_game_cache[k];
     if (!entry->valid || game_cache_source_exists(entry) ||
+        sm_shellcore_title_is_protected(entry->title_id) ||
         app_db_title_list_contains(auto_remove_titles, entry->title_id)) {
       continue;
     }
@@ -268,6 +272,8 @@ static void reconcile_missing_game_cache(
   bool cache_full_logged = false;
   for (int i = 0; i < auto_remove_titles->count; ++i) {
     const char *title_id = auto_remove_titles->ids[i];
+    if (sm_shellcore_title_is_protected(title_id))
+      continue;
     bool protected_by_dlc =
         title_is_protected_by_dlc(title_id, remove_games_with_dlc);
     bool image_source_exists =
@@ -347,6 +353,8 @@ void reconcile_missing_app_db_games(void) {
     for (int k = 0; k < MAX_PENDING; k++) {
       const struct GameCache *entry = &g_game_cache[k];
       if (!missing_timer_expired(entry, now_us, delay_us))
+        continue;
+      if (sm_shellcore_title_is_protected(entry->title_id))
         continue;
 
       (void)strlcpy(title_id, entry->title_id, sizeof(title_id));

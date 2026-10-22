@@ -14,10 +14,10 @@ static const char *const g_zh_cn[SM_L10N_COUNT] = {
     [SM_L10N_BACKPORT_OVERLAY_FAILED] = "向下兼容覆盖层挂载失败：%s\n%s\n0x%08X",
     /* English: Emulators applied to game: %s */
     [SM_L10N_GAME_EMULATORS_APPLIED] = "已为游戏 %s 应用模拟器",
-    /* English: Backport applied to game: %s */
-    [SM_L10N_GAME_BACKPORTED] = "已为游戏应用向下兼容补丁：%s",
-    /* English: Backport applied to game: %s\nEmulators updated */
-    [SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED] = "已为游戏应用向下兼容补丁：%s\n多个模拟器已更新",
+    /* English: Backport applied: %s */
+    [SM_L10N_GAME_BACKPORTED] = "已应用向下兼容补丁：%s",
+    /* English: Backport applied: %s\nEmulators updated */
+    [SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED] = "已应用向下兼容补丁：%s\n多个模拟器已更新",
     /* English: Image mount rejected:\n%s\nCluster size is too small (%llu < %u).\nSaved image_sector override: %u.\nTry mounting again. */
     [SM_L10N_IMAGE_REJECTED_CLUSTER_AUTOTUNED] = "镜像挂载被拒绝:\n%s\n簇大小太小 (%llu < %u)。\n已保存 image_sector 覆盖值: %u。\n请再次尝试挂载。",
     /* English: Image mount rejected:\n%s\nCluster size is too small (%llu < %u).\nUse a larger cluster size in the image or lower sector size in config. */
@@ -64,6 +64,8 @@ static const char *const g_zh_cn[SM_L10N_COUNT] = {
     [SM_L10N_AMPR_EMULATOR_UPDATED] = "AMPR 模拟器已更新",
     /* English: ShadowMount+: failed to install ShellCore hooks */
     [SM_L10N_SHELLCORE_HOOKS_FAILED] = "ShadowMount+：无法安装 ShellCore 钩子",
+    /* English: ShadowMount+: kstuff not found; waiting for it to start. */
+    [SM_L10N_KSTUFF_WAITING] = "ShadowMount+：未找到 kstuff，正在等待其启动",
     /* English: Target temperature %u °C → %u °C */
     [SM_L10N_TEMPERATURE_TRANSITION] = "目标温度 %u °C → %u °C",
     /* English: External drive %s connected\nFree %llu.%llu GB of %llu.%llu (Block size %llu KB)\nGames on drive: %d%s */

@@ -14,10 +14,10 @@ static const char *const g_ko_kr[SM_L10N_COUNT] = {
     [SM_L10N_BACKPORT_OVERLAY_FAILED] = "백포트 오버레이 마운트 실패: %s\n%s\n0x%08X",
     /* English: Emulators applied to game: %s */
     [SM_L10N_GAME_EMULATORS_APPLIED] = "게임 %s에 에뮬레이터가 적용되었습니다",
-    /* English: Backport applied to game: %s */
-    [SM_L10N_GAME_BACKPORTED] = "게임에 백포트 적용됨: %s",
-    /* English: Backport applied to game: %s\nEmulators updated */
-    [SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED] = "게임에 백포트 적용됨: %s\n에뮬레이터들이 업데이트됨",
+    /* English: Backport applied: %s */
+    [SM_L10N_GAME_BACKPORTED] = "백포트 적용됨: %s",
+    /* English: Backport applied: %s\nEmulators updated */
+    [SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED] = "백포트 적용됨: %s\n에뮬레이터들이 업데이트됨",
     /* English: Image mount rejected:\n%s\nCluster size is too small (%llu < %u).\nSaved image_sector override: %u.\nTry mounting again. */
     [SM_L10N_IMAGE_REJECTED_CLUSTER_AUTOTUNED] = "이미지 마운트 거부됨:\n%s\n클러스터 크기가 너무 작습니다 (%llu < %u).\nimage_sector override 저장됨: %u.\n다시 마운트해 보세요.",
     /* English: Image mount rejected:\n%s\nCluster size is too small (%llu < %u).\nUse a larger cluster size in the image or lower sector size in config. */
@@ -64,6 +64,8 @@ static const char *const g_ko_kr[SM_L10N_COUNT] = {
     [SM_L10N_AMPR_EMULATOR_UPDATED] = "AMPR 에뮬레이터가 업데이트되었습니다",
     /* English: ShadowMount+: failed to install ShellCore hooks */
     [SM_L10N_SHELLCORE_HOOKS_FAILED] = "ShadowMount+: ShellCore 후크 설치에 실패했습니다",
+    /* English: ShadowMount+: kstuff not found; waiting for it to start. */
+    [SM_L10N_KSTUFF_WAITING] = "ShadowMount+: kstuff를 찾을 수 없습니다. 시작을 기다리는 중입니다",
     /* English: Target temperature %u °C → %u °C */
     [SM_L10N_TEMPERATURE_TRANSITION] = "목표 온도 %u °C → %u °C",
     /* English: External drive %s connected\nFree %llu.%llu GB of %llu.%llu (Block size %llu KB)\nGames on drive: %d%s */

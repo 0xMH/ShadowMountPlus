@@ -61,6 +61,7 @@ device.
 | `/api/v1/games` | `{"include_size":false}` | Detailed game snapshot; optional physical source-size calculation |
 | `/api/v1/games/info` | `{"title_id":"PPSA12345"}` | Detailed app.db and source information for one game; size is always calculated |
 | `/api/v1/games/fakelib` | `{"title_id":"PPSA12345","mode":"emulators"}` | Persist the PS5 game's fakelib policy for its next launch |
+| `/api/v1/games/fakelib` | `{"title_id":"PPSA12345","ignore_global_fakelib":true}` | Ignore the global fakelib overlay for this PS5 game on its next launch |
 | `/api/v1/games/icon?title_id=PPSA12345[&size=thumb]` | GET | Stream the full PNG or a cached 128x128 thumbnail |
 | `/api/v1/games/mount` | `{"title_id":"PPSA12345","mode":"ro"}` | Mount a managed game, optionally overriding its image mode with `ro`/`rw` |
 | `/api/v1/games/unmount` | `{"title_id":"PPSA12345"}` | Unmount a managed game |
@@ -118,6 +119,15 @@ A successful version response has this shape:
 ```
 
 List responses contain `count` and the complete `images` or `games` array.
+Confirmed running `FAKE*` and `LAPY*` applications do not defer scans or block
+source copy/move/delete operations and uninstalls for unrelated titles. This
+applies to folder, image and installed-PKG applications. Ordinary PS4/PS5 games
+allow the same work while AppFocus confirms they are in the background. The
+live application's own title, source, and backing image chain remain protected;
+operations affecting them return `game_active`. Returning to an ordinary game,
+unknown focus, and pending launches/exits defer new background work. Focus
+changes wake the scanner; unblocking makes the next full resync due immediately.
+
 Image items expose `path`, `mount_point`, `size`, modification time, `unit_id`,
 `backend`, `complete`, `source_available`, `mapped` and `mounted`. Game items
 combine ShadowMount's game cache with `tbl_contentinfo` from app.db. They expose
@@ -219,6 +229,11 @@ Game responses also provide `can_uninstall`, `can_manage_source`,
 `fakelib_mode` is the resolved mode (`full`, `emulators`, `disabled`),
 `fakelib_mode_override` is the title's explicit mode or `default`, and
 `fakelib_default_mode` is the current global default.
+`ignore_global_fakelib` reports the title's `global_fakelib_exclude` setting.
+Post `title_id` and a boolean `ignore_global_fakelib` to update only that setting;
+do not combine it with `mode` or `enabled`. False removes the exclusion, including
+legacy `global_fakelib_exclude_title` entries. The game's own fakelib mode stays
+unchanged. Changes apply on the next launch and preserve active mounts.
 The fakelib route accepts only known PS5 games, including PKGs, images and
 folders. `PPSA` identifies PS5; `LAPY`/`FAKE` homebrew uses its `app.db` platform.
 Send `mode: "full"`, `"emulators"` or `"disabled"` to persist an explicit override,

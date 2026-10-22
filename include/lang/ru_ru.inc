@@ -12,12 +12,12 @@ static const char *const g_ru_ru[SM_L10N_COUNT] = {
     [SM_L10N_SCAN_DEPTH_ENABLED] = "ShadowMount+: включена глубина сканирования %u.",
     /* English: Backport overlay failed: %s\n%s\n0x%08X */
     [SM_L10N_BACKPORT_OVERLAY_FAILED] = "Не удалось смонтировать оверлей бэкпорта: %s\n%s\n0x%08X",
-    /* English: Backport applied to game: %s */
-    [SM_L10N_GAME_BACKPORTED] = "К игре %s применён бэкпорт",
+    /* English: Backport applied: %s */
+    [SM_L10N_GAME_BACKPORTED] = "Применён бэкпорт: %s",
     /* English: Emulators applied to game: %s */
     [SM_L10N_GAME_EMULATORS_APPLIED] = "К игре %s применены эмуляторы",
-    /* English: Backport applied to game: %s\nEmulators updated */
-    [SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED] = "К игре %s применён бэкпорт\nЭмуляторы обновлены",
+    /* English: Backport applied: %s\nEmulators updated */
+    [SM_L10N_GAME_BACKPORTED_EMULATORS_UPDATED] = "Применён бэкпорт: %s\nЭмуляторы обновлены",
     /* English: Image mount rejected:\n%s\nCluster size is too small (%llu < %u).\nSaved image_sector override: %u.\nTry mounting again. */
     [SM_L10N_IMAGE_REJECTED_CLUSTER_AUTOTUNED] = "Не удалось смонтировать образ:\n%s\nРазмер кластера слишком мал (%llu < %u).\nСохранено значение image_sector: %u.\nПопробуйте смонтировать снова.",
     /* English: Image mount rejected:\n%s\nCluster size is too small (%llu < %u).\nUse a larger cluster size in the image or lower sector size in config. */
@@ -64,6 +64,8 @@ static const char *const g_ru_ru[SM_L10N_COUNT] = {
     [SM_L10N_AMPR_EMULATOR_UPDATED] = "Эмулятор AMPR обновлён",
     /* English: ShadowMount+: failed to install ShellCore hooks */
     [SM_L10N_SHELLCORE_HOOKS_FAILED] = "ShadowMount+: не удалось установить хуки ShellCore",
+    /* English: ShadowMount+: kstuff not found; waiting for it to start. */
+    [SM_L10N_KSTUFF_WAITING] = "ShadowMount+: ожидание его запуска Kstuff...",
     /* English: Target temperature %u °C → %u °C */
     [SM_L10N_TEMPERATURE_TRANSITION] = "Целевая температура %u °C → %u °C",
     /* English: External drive %s connected\nFree %llu.%llu GB of %llu.%llu (Block size %llu KB)\nGames on drive: %d%s */
